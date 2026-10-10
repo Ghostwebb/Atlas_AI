@@ -1,9 +1,10 @@
 "use client";
 
-import { useRef, useState, type CSSProperties } from "react";
+import { useCallback, useRef, useState, type CSSProperties } from "react";
 import Link from "next/link";
 import AgentGlyph from "./AgentGlyph";
 import AgentEditor from "./AgentEditor";
+import CommitteeDeliberation from "./CommitteeDeliberation";
 import { committeeFixtures, initialAgents, type InvestmentAgent } from "./agents-data";
 import s from "./agents.module.css";
 
@@ -28,6 +29,7 @@ export default function AgentsWorkspace() {
   const [editor, setEditor] = useState<InvestmentAgent | "new" | null>(null);
   const [deliberating, setDeliberating] = useState(false);
   const [decided, setDecided] = useState(false);
+  const [run, setRun] = useState(0);
   const [activity, setActivity] = useState<Activity[]>([]);
   const busy = useRef(false);
   const counter = useRef(0);
@@ -44,17 +46,15 @@ export default function AgentsWorkspace() {
     setActivity(items => [entry, ...items]);
   }
 
-  async function compare() {
+  const completeDeliberation = useCallback(() => {
+    setDecided(true); setDeliberating(false); busy.current = false;
+    setActivity(items => [{ id: ++counter.current, title: "Decisión de ejemplo disponible", detail: fixture.decision.title }, ...items]);
+  }, [fixture]);
+  function compare() {
     if (busy.current || !canCompare) return;
-    busy.current = true;
-    setDeliberating(true);
-    setDecided(false);
-    log("Deliberación iniciada", `${fixture.name} · lectura de las cuatro propuestas de ejemplo.`);
-    await new Promise(resolve => setTimeout(resolve, 1100));
-    setDecided(true);
-    setDeliberating(false);
-    busy.current = false;
-    log("Decisión de ejemplo disponible", fixture.decision.title);
+    busy.current = true; setView("committee"); setRun(value => value + 1);
+    setDeliberating(true); setDecided(false);
+    log("Deliberación simulada iniciada", "Barras temporizadas de demostración, sin análisis real.");
   }
 
   function selectAgent(id: string) {
@@ -97,6 +97,7 @@ export default function AgentsWorkspace() {
         <div className={s.scenarioControl}><label htmlFor="example-case">Caso de ejemplo</label><select id="example-case" value={fixtureId} disabled={deliberating} onChange={event => { setFixtureId(event.target.value); setDecided(false); log("Caso de ejemplo cambiado", committeeFixtures.find(item => item.id === event.target.value)!.name); }}>{committeeFixtures.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
       </div>
 
+      {(deliberating || decided) && <CommitteeDeliberation key={run} decision={fixture.decision} onComplete={completeDeliberation}/> }
       <div className={s.workspaceGrid}>
         <div className={s.primaryColumn}>
           {view === "committee" && <>
