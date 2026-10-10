@@ -92,6 +92,15 @@ def test_omitted_evidence_is_rejected():
         _check(data, packet)
 
 
+@pytest.mark.parametrize("foreign_id", ["risk", "recommendation", "limitation.SYNTHETIC_DATA"])
+def test_valid_anchor_cannot_mask_foreign_section_evidence(foreign_id):
+    data, packet = _mutated(
+        lambda d: d["supportingReasons"][0]["evidenceIds"].append(foreign_id)
+    )
+    with pytest.raises(InvalidNarrativeError, match="outside its section"):
+        _check(data, packet)
+
+
 def test_invented_section_content_is_rejected():
     data, packet = _mutated(lambda d: d.update(counterpoints=[
         {"text": "Una señal contraria inventada.", "evidenceIds": ["momentum"]}]))

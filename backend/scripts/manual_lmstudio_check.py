@@ -14,6 +14,7 @@ JSON result is written to scripts/manual_lmstudio_result.json (git-ignored).
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -59,7 +60,8 @@ def main() -> int:
           f"temperature={settings.temperature} max_tokens={settings.max_output_tokens}")
     print(f"status={narrative.status.value} reason={narrative.reason.code.value if narrative.reason else None} "
           f"elapsed={elapsed:.1f}s")
-    out = Path(__file__).with_name("manual_lmstudio_result.json")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    out = Path(__file__).with_name(f"manual_lmstudio_result_{symbol}_{language}_{stamp}.json")
     out.write_text(json.dumps(narrative.model_dump(mode="json"), indent=2, ensure_ascii=False))
     print(f"Narrative written to {out}")
     return 0 if narrative.status.value == "generated" else 1

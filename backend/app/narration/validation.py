@@ -94,6 +94,9 @@ def _check_structure(report: NarrativeReport, packet: EvidencePacket) -> None:
             hits = set(point.evidenceIds) & set(required)
             if not hits:
                 raise InvalidNarrativeError(f"a point in {section} cites none of its evidence")
+            misplaced = set(point.evidenceIds) - set(required)
+            if misplaced:
+                raise InvalidNarrativeError(f"a point in {section} cites evidence outside its section: {sorted(misplaced)}")
             cited |= hits
         missing = [i for i in required if i not in cited]
         if missing:

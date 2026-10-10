@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
-backend/scripts/manual_lmstudio_result.json
+backend/scripts/manual_lmstudio_result*.json
 
 # Env files (keep only the .example files in the repo)
 .env
