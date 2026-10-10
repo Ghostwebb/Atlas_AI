@@ -374,6 +374,14 @@ objective or portfolio. On the synthetic demo dataset no symbol reaches `aligned
 Policy, contract, real examples and the frontend handoff are in
 [docs/phase-8-investment-committee.md](docs/phase-8-investment-committee.md).
 
+## Backend delivery (integration handoff)
+
+Branch `feat/backend-delivery-ready` combines PR #3 (Paper Trading), #7 (agents) and #8 (committee)
+on top of `main`, without frontend changes. Routes, variables, examples, the demo script and its
+honest fallbacks (Gemma unavailable, Alpaca not configured, market closed) are in
+[docs/final-frontend-handoff.md](docs/final-frontend-handoff.md). The visual integration is still
+pending.
+
 ## Later phases
 
 - Frontend: dashboard charts, supervision, narrative and paper trading panels.
