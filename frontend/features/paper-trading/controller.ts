@@ -61,6 +61,10 @@ export interface ControllerState {
    *  until a consistent read. Status checks remain available. */
   readonly suspect: boolean;
   readonly lastError: ControllerError | null;
+  /** Error of the last human action (prepare / confirm / cancel). Unlike lastError, a later
+   *  successful read does not clear it; it is cleared by the next action, a new operation, or when
+   *  an uncertain confirmation is resolved by the backend. */
+  readonly actionError: ControllerError | null;
   /** Delay in ms of the scheduled follow-up read, or null when none is scheduled. */
   readonly nextReadInMs: number | null;
   readonly canPrepare: boolean;
@@ -119,6 +123,7 @@ export function createPaperTradingController(options: ControllerOptions) {
   // Fixed when the operation is adopted (prepare or resume); later responses must match it.
   let identity: OperationIdentity | null = null;
   let lastError: ControllerError | null = null;
+  let actionError: ControllerError | null = null;
   let failures = 0;
   let readPromise: Promise<void> | null = null;
   let timer: unknown = null;
@@ -147,7 +152,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     const idleMutations = busy === null && !disposed;
     return Object.freeze({
       notice: PAPER_NOTICE, source, phase: ph, proposal, order, busy,
-      reading: readPromise !== null, confirmUncertain, cancelUncertain, verifying, suspect, lastError,
+      reading: readPromise !== null, confirmUncertain, cancelUncertain, verifying, suspect, lastError, actionError,
       nextReadInMs: timerDelay,
       canPrepare: idleMutations && ["idle", "review", "expired", "final"].includes(ph),
       canConfirm: idleMutations && ph === "review" && !verifying && !suspect && proposal !== null && policyCanConfirm(proposal, now()),
@@ -232,7 +237,7 @@ export function createPaperTradingController(options: ControllerOptions) {
         // Only explicit backend states end the local uncertainty. "open + not_submitted" does not:
         // the lost request may still be processed.
         const proof = local.status === "expired" || local.submissionStatus !== "not_submitted";
-        if (proof) confirmUncertain = false;
+        if (proof) { confirmUncertain = false; actionError = null; }
       }
       return;
     }
@@ -303,7 +308,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     proposal = null; order = null;
     confirmUncertain = false; cancelUncertain = false; verifying = false; suspect = false;
     identity = null;
-    lastError = null; failures = 0;
+    lastError = null; actionError = null; failures = 0;
   }
 
   // --- public API ---------------------------------------------------------------
@@ -318,6 +323,7 @@ export function createPaperTradingController(options: ControllerOptions) {
       body = proposalRequest(input);
     } catch (error) {
       lastError = { ...toError(error), code: "INVALID_INPUT", message: "Datos de la propuesta no válidos." };
+      actionError = lastError;
       emit();
       return { ok: false, reason: "error" };
     }
@@ -339,6 +345,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
       lastError = toError(error);
+      actionError = lastError;
       return { ok: false, reason: "error" };
     } finally {
       done();
@@ -358,6 +365,7 @@ export function createPaperTradingController(options: ControllerOptions) {
       return { ok: false, reason: "not_allowed" };
     }
     busy = "confirm"; // synchronous lock: a second call before any render sees it
+    actionError = null;
     const id = proposal.id;
     const mySession = session;
     clearTimer();
@@ -373,6 +381,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
       lastError = toError(error);
+      actionError = lastError;
       // Definite answer from ATLAS: re-read before offering confirm again.
       // Anything else (network, abort, malformed, unknown code): the order MAY exist.
       if (isDefinite(lastError)) verifying = true;
@@ -397,6 +406,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     if (busy !== null) return { ok: false, reason: "busy" };
     if (!snapshot.canCancel || proposal === null || !proposal.brokerOrderId) return { ok: false, reason: "not_allowed" };
     busy = "cancel"; // synchronous lock
+    actionError = null;
     const orderId = proposal.brokerOrderId;
     const mySession = session;
     emit();
@@ -411,6 +421,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
       lastError = toError(error);
+      actionError = lastError;
       result = { ok: false, reason: "error" };
     } finally {
       done();

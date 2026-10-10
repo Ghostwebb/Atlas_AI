@@ -1,9 +1,9 @@
-# Paper Trading logic (Phase 6, technical part)
+# Paper Trading (Phase 6): logic and standalone screen
 
-Based on frontend `fbf3ae3`; API contract checked against backend `cd951e7`
-(`docs/phase-6-integration-handoff.md`). No dashboard, navigation, styles, shared
-configuration, agent components or backend changes. **This is not a UI and not a finished
-integration**: the visual wiring is a later coordinated PR.
+Based on frontend `fbf3ae3` and the reviewed logic `781ecfc` (PR #5); API contract checked against
+backend `cd951e7` (`docs/phase-6-integration-handoff.md`). The screen lives on its own route
+`/paper-trading`. The dashboard, navigation, global styles, shared configuration and the agent
+components are **not** modified.
 
 | File | Purpose |
 |---|---|
@@ -16,6 +16,12 @@ integration**: the visual wiring is a later coordinated PR.
 | `contract.test.mjs`, `controller.test.mjs`, `identity-cancel.test.mjs` | Fixture-only tests (Node test runner) |
 | `test-fixtures.mjs` | Shared simulated HTTP fixtures, manual clock and scheduler |
 | `run-tests.sh` | Compiles the folder to a temp dir and runs all test files |
+| `ui/PaperTradingScreen.tsx` | Client screen for `/paper-trading` (route file: `app/paper-trading/page.tsx`) |
+| `ui/OrderForm.tsx`, `ui/OperationPanel.tsx`, `ui/AccountPanel.tsx`, `ui/ErrorNotice.tsx` | Form, review/tracking, account, errors |
+| `ui/account.ts` | Read-only status, account and positions loading with runtime validation |
+| `ui/labels.ts` | Spanish labels for states and error codes |
+| `ui/paper-trading.css` | Local styles (`.pt-` prefix) reusing the approved design tokens |
+| `e2e/paper-trading.e2e.mjs`, `e2e/run-e2e.sh` | Browser tests (Chromium) with intercepted HTTP fixtures |
 
 ## Public API
 
@@ -39,6 +45,10 @@ ctl.dispose();                  // abort requests, clear timers, ignore late res
 
 Actions return `{ ok: true }` or `{ ok: false, reason: "busy" | "not_allowed" | "disposed" | "error" }`.
 Errors are in `state.lastError` (`code`, `message`, `status`, `correlationId`, `proposalId`).
+`state.actionError` keeps the error of the last human action (prepare, confirm or cancel). A later
+successful read does not clear it, so a message like `RESOURCE_RESERVED` stays visible after the
+controller re-reads the proposal. It is cleared by the next action, by a new operation, or when an
+uncertain confirmation is resolved.
 
 `ControllerState` keeps the backend lifecycles separate: `proposal.status`,
 `proposal.submissionStatus`, `proposal.brokerStatus` / `order.status` and
@@ -205,9 +215,104 @@ Mutation checks run by hand (each one makes at least one test fail):
 
 Project checks: `./node_modules/.bin/tsc --noEmit -p .`, `npm run lint`, `npm run build`.
 
+## The `/paper-trading` screen
+
+**Open it.**
+
+1. Start the backend with paper trading configured (below).
+2. Start the frontend: `cd frontend && npm run dev`.
+3. Open http://localhost:3000/paper-trading.
+
+The dashboard has no link to it yet, because adding one means editing `app/page.tsx`, a shared
+file (see "Coordination").
+
+**Backend configuration (local only).** Export these variables in the shell that runs uvicorn;
+the backend does not read `.env` by itself:
+
+- `ATLAS_PAPER_TRADING_ENABLED=true`
+- `ATLAS_ALPACA_PAPER_API_KEY` and `ATLAS_ALPACA_PAPER_SECRET_KEY` (paper keys)
+- `ATLAS_CORS_ORIGINS=http://localhost:3000`
+
+Then run `./.venv/bin/uvicorn app.main:app --port 8000`. Details are in
+`docs/phase-6-integration-handoff.md` § 2.
+
+- The frontend only needs `NEXT_PUBLIC_API_URL` (default `http://localhost:8000`) and never holds credentials.
+- The backend has no authentication: do not expose it or this app on the internet.
+
+**What the screen does.**
+
+- **Permanent banner:** "Paper Trading — dinero ficticio".
+- **Availability:** feature status (Disponible, Deshabilitada, Sin configurar, Inaccesible, Alpaca Paper inaccesible), market state and next open.
+- **Account and positions:** read from the backend. Missing values show "No disponible", never 0.
+- **No automatic polling of `/status`:** it calls Alpaca every time, so it is read on mount, with "Actualizar", and after an operation ends.
+- **Form:** buy by USD amount, or reduce a position by shares. Values stay decimal strings, and preparing never confirms.
+- **Review:**
+  - symbol, side and amount;
+  - order type;
+  - expiry countdown (display only);
+  - checks, warnings, and the notice that preparing neither sends nor reserves.
+- **Confirmation:** one explicit button calls `controller.confirm()` from its `onClick`. It is enabled only by `canConfirm`. Nothing confirms from effects, mount, polling, reports or recommendations.
+- **Tracking:**
+  - separate rows for proposal, submission, broker status, executed quantity with average price, and reservation;
+  - "Consultar estado" (`canCheckStatus`);
+  - "Cancelar orden" (`canCancel`, explicit allow-list);
+  - why cancel is unavailable (`pending_cancel`, unknown status);
+  - an uncertain banner with no resend button.
+- **Errors:** a readable message plus "Detalle técnico" (`code`, `message`, `correlationId`). No force-release or bypass controls exist.
+- **Reload:** the tab keeps only `proposal.id` in `sessionStorage` and resumes following it read-only on mount. If the id is lost, the order may still exist at Alpaca; this is not a broker guarantee.
+- **Accessibility:**
+  - visible labels and keyboard-reachable controls;
+  - focus moves to the review, then to the status heading, only when the phase changes;
+  - one polite live region announces phase changes, not polling ticks;
+  - `aria-busy` while loading.
+- **Data separation:** a card states that ATLAS analysis is synthetic and never used here, that account data comes from the backend, and that fixtures exist only in tests.
+
+**Browser tests** (real React mount, Next.js dev server with StrictMode, Chromium). Every call to
+the backend URL is intercepted with simulated fixtures, so there is no backend, Alpaca or
+credentials. Playwright is used from outside the project, and no dependency is added:
+
+```bash
+cd frontend
+features/paper-trading/e2e/run-e2e.sh          # PLAYWRIGHT_MODULE defaults to $(npm root -g)/playwright
+E2E_SCREENSHOTS=/tmp/shots features/paper-trading/e2e/run-e2e.sh   # also saves desktop/mobile screenshots
+```
+
+They cover:
+
+1. prepare, review and explicit confirm;
+2. a double click sending one confirm;
+3. expiry;
+4. a lost confirm, the uncertain state and a status check without resend;
+5. a partial then final fill;
+6. `pending_cancel` then `canceled`;
+7. a cancel losing the race to a fill;
+8. `RESOURCE_RESERVED` and `RECONCILIATION_REQUIRED`;
+9. an unknown status (check allowed, cancel blocked);
+10. a wrong-identity response blocking actions;
+11. unmount and remount, with no duplicate polling and late responses ignored;
+12. the dashboard report and analysis making zero paper calls;
+13. no horizontal scroll at 1440 px and 390 px, plus keyboard focus.
+
+Test 12b checks the committee view of `codex/agents-workspace` when `E2E_COMMITTEE_URL` points to a server running that branch.
+
+## Coordination and PR dependencies
+
+- **This PR depends on:**
+  - #4 (approved frontend, `fbf3ae3`);
+  - #5 (logic, `781ecfc`): it targets that branch, so its diff contains only the integration;
+  - #3 (backend, `cd951e7`): needed at runtime.
+- **Files that need coordination with the frontend owner before any change:**
+  - `app/page.tsx` (a navigation link to `/paper-trading`);
+  - `app/layout.tsx`, `app/globals.css`, `next.config.ts`;
+  - `components/*` (including the friend's `components/agents/` and the `components/paper/` area assigned to them);
+  - `lib/*`.
+- **CSS Modules:** in the base, `next.config.ts` runs every `*.css` through the Tailwind loader, which breaks CSS Modules (the friend's branch changes this). This screen therefore uses a plain stylesheet with `.pt-` prefixed selectors and does not depend on that change.
+
 ## Limitations and pending items
 
-- No visual integration yet. A coordinated PR with the friend's components is next.
+- Not validated against a real backend with real Alpaca Paper keys; all tests use fixtures. That run needs the user's paper keys in the backend and explicit authorization.
+- No dashboard link to `/paper-trading` yet (needs coordination on `app/page.tsx`).
+- Visual checks were made on Chromium only (desktop 1440 px, mobile 390 px), with the Google font blocked, so the system font fallback was used.
 - Not run against a real backend with real Alpaca Paper keys. That needs the user's explicit authorization.
 - After a lost confirm, if ATLAS still shows `open + not_submitted`, the operation stays uncertain until the backend proves otherwise or the proposal expires (TTL, 300 s by default).
 - One controller per operation. Several concurrent orders need several controllers.
