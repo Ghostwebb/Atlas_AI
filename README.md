@@ -196,7 +196,10 @@ fallback in both languages, connection/timeout/HTTP/malformed/busy cases and the
 HTTP transport (no test calls Alpaca): configuration guards, validation rules, idempotent and
 concurrent confirmation, uncertain submissions, reconciliation, restart recovery, fills,
 cancellation and the `/api/paper` contract. Phase 5.5 adds reservation tests across proposals
-(concurrency, stale snapshots, double counting, fills, migration, leases).
+(concurrency, stale snapshots, double counting, fills, migration, leases). Phase 7 adds
+strategy-agent tests: exact rule boundaries, missing and non-interpretable data, windows, units,
+evidence references, determinism, disagreement and the `/api/agents/analyze` contract. Phase 8
+adds committee tests (states, precedence, requirements, shared evidence, integrity).
 
 Frontend checks:
 
@@ -214,6 +217,10 @@ npm run build
 - `POST /api/report` with `{ "symbol": "NVDA", "language": "es" }` → `{ analysis, narrative }`
   (see Phase 4 below).
 - `/api/paper/*`: Alpaca Paper Trading lab (see Phase 5 below).
+- `POST /api/agents/analyze` with `{ "symbol": "NVDA" }` → four strategy evaluations on one shared
+  snapshot (see Phase 7 below).
+- `POST /api/committee/analyze` with `{ "symbol": "NVDA" }` → the agents response plus a deterministic
+  committee reading (see Phase 8 below).
 
 Errors (`400` malformed input, `404` unknown symbol) share one shape:
 
@@ -325,6 +332,47 @@ event is added per measure. The frontend integration contract is in
 The backend has no authentication: run it locally only. Contract, states, errors, frontend
 guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).
 The check against a real Alpaca Paper account has not been run yet.
+
+## Strategy agents (Phase 7)
+
+`POST /api/agents/analyze` evaluates one symbol with four explicit, deterministic strategies on
+the same snapshot. Each returns its own stance (`favorable`, `neutral`, `unfavorable` or
+`insufficient_data`), a score in [−1, 1], data coverage, evidence with references to
+`snapshot.metrics`, risks, missing data and limitations:
+
+- ARGO (value);
+- NOVA (growth);
+- VECTOR (momentum);
+- AEGIS (capital preservation).
+
+These are rules, not an LLM. They run on the synthetic demo dataset, and ARGO is only a limited
+P/E lens because the dataset has no book value, cash flow or debt. The agents do **not** form a
+committee yet, choose a winner, recommend allocations or create orders; that comparison is
+planned for Phase 8, and no agent will execute orders automatically. `/api/analyze` and
+`/api/report` are unchanged. Invalid price or volume observations (zero, negative, NaN or
+infinite) are never used: a metric whose window contains one is `null` with an explicit cause.
+Risk checks that could not run are listed apart (`risksNotEvaluated`); `coverage` only measures the
+scored criteria. Rules, thresholds, contract (`agents.v1.1`) and examples are in
+[docs/phase-7-investment-agents.md](docs/phase-7-investment-agents.md).
+
+## Investment committee (Phase 8)
+
+`POST /api/committee/analyze` compares the four strategy evaluations of one symbol on one snapshot.
+It returns a deterministic reading: `insufficient_data`, `conflicted`, `aligned_unfavorable`,
+`aligned_favorable`, `caution` or `neutral`. The reading comes with:
+
+- the requirements that were or were not met;
+- agreements counted on independent evidence (shared metrics count once), and conflicts;
+- arguments, counterpoints, observed and unevaluated risks, abstentions, missing data, conditions and limitations;
+- references to the published evidence.
+
+AEGIS acts as a risk gate, not as an extra vote. Insufficient agents abstain.
+
+The committee does not invest, does not pick a winning agent, does not average scores and does
+not predict or guarantee returns. It never creates proposals or orders and knows no user
+objective or portfolio. On the synthetic demo dataset no symbol reaches `aligned_favorable`.
+Policy, contract, real examples and the frontend handoff are in
+[docs/phase-8-investment-committee.md](docs/phase-8-investment-committee.md).
 
 ## Later phases
 
