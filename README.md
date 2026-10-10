@@ -299,6 +299,14 @@ submission keeps its reservation until Alpaca reports the order as final. Capaci
 over-commit and acknowledged orders are not counted twice. New codes: `RESOURCE_RESERVED` and
 `RECONCILIATION_REQUIRED` (409). Existing Phase 5 databases are migrated in place.
 
+**Phase 5.6 (executed consumption):** ATLAS keeps a local ledger of its own fills (cash and shares
+per symbol) from a trusted checkpoint, and caps availability at `min(snapshot, ledger)`. A fill that
+Alpaca's account or position snapshot does not show yet stays protected, and a fresh snapshot is not
+counted twice. Alpaca exposes no snapshot timestamps or versions, so when an operation fits the
+snapshot but not the ledger, the answer is `RECONCILIATION_REQUIRED` until the broker catches up.
+Order observations are monotonic. Pre-5.6 local data is marked unverifiable. See
+`docs/phase-5-paper-trading.md` → "Phase 5.6".
+
 The backend has no authentication: run it locally only. Contract, states, errors, frontend
 guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).
 The check against a real Alpaca Paper account has not been run yet.

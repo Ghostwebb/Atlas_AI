@@ -131,8 +131,10 @@ class FakeBroker:
         order = self.orders[order_id]
         qty_d, price_d = D(qty), D(price)
         previous = D(order["filled_qty"])
+        previous_cost = previous * D(order["filled_avg_price"]) if order.get("filled_avg_price") else Decimal(0)
         order["filled_qty"] = str(previous + qty_d)
-        order["filled_avg_price"] = price
+        # Volume-weighted average, as Alpaca reports filled_avg_price.
+        order["filled_avg_price"] = str((previous_cost + qty_d * price_d) / (previous + qty_d))
         order["status"] = "filled" if final else "partially_filled"
         cost = qty_d * price_d
         pos = self.positions.setdefault(order["symbol"], {"symbol": order["symbol"], "side": "long", "qty": "0",

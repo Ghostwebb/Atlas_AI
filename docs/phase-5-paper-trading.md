@@ -340,11 +340,124 @@ They cover ATLAS proposals that share this SQLite file. Orders placed from the A
 other clients only count once Alpaca's snapshots or open-order list show them. Alpaca remains the
 final authority and may still reject an order.
 
-Residual risk: if the account or position snapshot is older than an order that has **already
-finished** (so it no longer appears in the open-order list) and ATLAS already recorded it as
-final, that order's effect is not visible in either view. The local check could then allow up to
-that amount. Alpaca's own buying-power and position checks still apply. SQLite on one machine is
-assumed; a network file system is not supported.
+The Phase 5.5 residual risk (a snapshot older than a fill that ATLAS already recorded) is closed
+by Phase 5.6 below. SQLite on one machine is assumed; a network file system is not supported.
+
+## Phase 5.6: executed consumption and stale snapshots
+
+### Defects fixed
+
+An independent review of `8aa3d4b` showed that fills more recent than the account or position
+snapshot could be reused. Both reproductions are now regression tests
+(`tests/test_paper_consumption.py`).
+
+| Reproduction (frozen snapshot) | Before (`8aa3d4b`) | After |
+|---|---|---|
+| A. Budget $100, buy $100 partially filled ($50 executed, $50 open), then a $50 buy | Sent `['100.00', '50.00']` | `RECONCILIATION_REQUIRED`, sent `['100.00']` |
+| B. Position 1, sell 1 fully filled, then sell 1 | Sent `['1', '1']` | `RECONCILIATION_REQUIRED`, sent `['1']` |
+
+In 5.5, the open-order list only covered the unfilled remainder, and a reservation was released as
+soon as Alpaca reported `filled`. The executed part was then protected by nothing when the snapshot
+had not caught up.
+
+### What Alpaca can and cannot prove
+
+The Alpaca docs show no timestamp, version or sequence number on the account object or on positions
+(`GET /v2/positions` returns only values). Fill activities carry `transaction_time`, but nothing
+links them to a balance or position snapshot. ATLAS therefore never assumes that:
+- a later request returns newer data;
+- two equal answers prove freshness;
+- waiting a fixed time synchronizes endpoints;
+- `filled` updates the account or position at the same time;
+- an order missing from the open list frees anything.
+
+### Policy: local fill ledger + checkpoint
+
+ATLAS records every fill it observes, cumulatively and per reservation (`filled_qty`,
+`filled_notional`, monotonic). Each fill changes two **measures**:
+
+| ATLAS order | `cash` | `qty:<SYMBOL>` |
+|---|---|---|
+| buy | − filled notional | + filled qty |
+| sell | + filled notional | − filled qty |
+
+`ledger_checkpoints(measure, value, base_effect)` stores a trusted value per measure. It is created
+inside the claim transaction the first time ATLAS uses the measure, from the snapshot at that
+moment, when ATLAS has never touched it. It is moved to a new snapshot **only** while ATLAS has no
+active reservation and no fill since the checkpoint on that measure. A checkpoint therefore never
+moves to a snapshot that might lack an ATLAS fill.
+
+```text
+expected(measure) = checkpoint.value + (sum of ATLAS effects now − checkpoint.base_effect)
+
+cash available   = min(non_marginable_buying_power, cash − open buy holds, expected cash − open buy holds)
+shares available = min(qty_available, qty − open sell remaining, expected qty − open sell remaining)
+```
+
+Then the 5.5 rules apply: local reservations not visible in the open-order list are subtracted, and
+uncertain submissions block.
+
+### Why nothing is counted twice
+
+If only ATLAS trades the account, a snapshot that includes every observed fill equals the expected
+value, and the minimum is just the snapshot. A snapshot that lacks a fill is higher than expected, so
+the ledger bound applies and the fill is protected. The pending remainder of an open order is
+counted once, through the open-order list or the local reservation. The executed part is counted
+once, through the ledger.
+
+### Decisions
+
+| Situation | Result |
+|---|---|
+| Fits the proven availability (snapshot and ledger) | Allowed |
+| Fits the snapshot but not the ledger (executions not reflected yet) | `RECONCILIATION_REQUIRED`: "Recent executions are not yet reflected in the broker balance or position. Check the order status and try again." |
+| More than the snapshot shows | `INSUFFICIENT_BUYING_POWER` / `INSUFFICIENT_POSITION` |
+| Measure touched by pre-5.6 data (no trusted checkpoint) | `RECONCILIATION_REQUIRED`: "Earlier executions recorded by a previous version cannot be verified. Check the account in Alpaca before another operation." |
+
+### Release conditions
+
+- **Pending part** (`amount − executed`): released only on not-sent, explicit rejection, or a final
+  Alpaca status. `pending_cancel` keeps it. A cancel that ends with fills frees only the unfilled
+  remainder.
+- **Executed part**: never released. It stays in the ledger, also for `expired`, `rejected` or
+  `canceled` orders with fills. It stops limiting operations only when broker snapshots catch up
+  with it (the snapshot value is then at or below the expected value). There is no timeout and no
+  endpoint to override it.
+
+### Monotonic observation
+
+All order reads (refresh, `/orders/{id}`, reconcile, recovery, cancel) go through one function that
+updates the proposal, the reservation fills and the audit event in one transaction. Inside that
+transaction it refuses (`stale_order_ignored`) any response with fewer filled shares than already
+recorded, or a non-final status after a final one. Repeating the same observation changes nothing.
+Before each decision ATLAS refreshes **all** active orders, because a buy also changes the share
+ledger and a sell also changes the cash ledger.
+
+### Recovery
+
+- **Executions not reflected yet:** retry later. As soon as Alpaca's account or position shows the
+  fills, the snapshot equals the ledger and operations are allowed again. `/reconcile` refreshes
+  the order status.
+- **Restart:** the ledger and checkpoints are in SQLite; nothing is lost and protection continues.
+- **Migration** (`user_version` 2 → 3, one transaction): copies stored fills onto each reservation,
+  creates `ledger_checkpoints`, and marks every measure touched by pre-5.6 rows as **unverifiable**
+  (`value NULL`). Those measures return `RECONCILIATION_REQUIRED`, because no trusted baseline exists
+  for fills recorded before the ledger. This only concerns local databases written by the
+  unreleased 5.5 code. To recover, check in the Alpaca dashboard that no orders are open, then start
+  with a new local database (`backend/var/paper_trading.sqlite3`). Alpaca's data is not affected.
+
+### Operational limits
+
+- The ledger assumes ATLAS is the only client trading this paper account. Trades from the
+  dashboard or other clients are not in the ledger. If they lower a balance or position, the
+  snapshot shows it and is used. If they raise one (for example a dashboard sale adding cash),
+  ATLAS keeps using its lower ledger value until it can move the checkpoint (no ATLAS activity on
+  that measure). That is conservative, not unsafe.
+- Fill values are recomputed from Alpaca's `filled_qty × filled_avg_price`. A cent-level difference
+  with Alpaca's booking can only lower the usable amount by that difference.
+- An order whose fills Alpaca already applies to a snapshot but does not yet report on the order
+  itself cannot be detected. ATLAS assumes that an order's fill record is never behind its effect
+  on the account or position.
 
 ## Audit trail
 
@@ -352,7 +465,7 @@ The SQLite `events` table records `proposal_created`, `validation_failed`, `subm
 `broker_accepted`, `broker_rejected`, `submission_not_sent`, `submission_unknown`,
 `reconciled`, `reconcile_not_found`, `recovered_after_restart`, `order_status`,
 `proposal_expired`, `cancel_requested`, `cancel_rejected`, `cancel_result`, `order_observed`,
-`submission_lease_expired` and `reservation_backfilled`, with ids,
+`submission_lease_expired`, `reservation_backfilled` and `stale_order_ignored`, with ids,
 timestamps, states, amounts and the correlation id. No secrets and no narrative text are stored.
 
 ## Examples
@@ -496,7 +609,8 @@ Sell larger than the available position (422):
 - `RESOURCE_RESERVED`: show "Hay acciones comprometidas por otra orden" (sell) or "Hay
   presupuesto reservado por una operación pendiente" (buy), with a link to the pending order.
   `RECONCILIATION_REQUIRED`: show "Debes consultar el estado antes de intentar otra operación"
-  and offer **Check status** on the uncertain proposal. Never offer a button that releases a
+  and offer **Check status** on the uncertain proposal. Since Phase 5.6 it also means "recent
+  executions are not yet reflected by the broker": show the message and let the user retry later. Never offer a button that releases a
   reservation. You may show `proposal.reservation` (state, amount, consumed).
 - Generating the narrative report must never create or confirm an order.
 

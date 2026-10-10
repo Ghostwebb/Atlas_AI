@@ -378,8 +378,11 @@ def test_22_migrates_a_phase5_database_conservatively(tmp_path):
     _phase5_database(path)
     repo = Repository(path)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3   # 5.5 (v2) then 5.6 (v3)
         assert conn.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 5
+        # Phase 5.6: measures touched by pre-5.6 rows have no trusted baseline.
+        unverifiable = {r[0] for r in conn.execute("SELECT measure FROM ledger_checkpoints WHERE value IS NULL")}
+        assert unverifiable == {"cash", "qty:NVDA", "qty:AAPL"}
     by_proposal = {r["proposal_id"][0]: r for r in repo.all_active_reservations()}
     assert set(by_proposal) == {"a", "b", "e"}                     # filled and never-sent rows get none
     assert (by_proposal["a"]["state"], by_proposal["a"]["amount"], by_proposal["a"]["resource_type"]) == ("held", "1", "shares")

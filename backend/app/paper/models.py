@@ -241,6 +241,8 @@ class Reservation(_Strict):
     consumed: Decimal
     state: ReservationState
     releaseReason: ReleaseReason | None
+    filledQty: Decimal = Decimal(0)        # cumulative shares filled (Phase 5.6)
+    filledNotional: Decimal = Decimal(0)   # cumulative filled value in USD (Phase 5.6)
 
 
 class Proposal(_Strict):

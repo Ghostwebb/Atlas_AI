@@ -29,8 +29,28 @@ the broker snapshot includes it:
 Reservations whose order IS in L are covered by the min() above and are not
 subtracted twice.
 
+Executed consumption (Phase 5.6). Alpaca exposes no timestamp, version or
+sequence on account or position snapshots, so nothing proves that a snapshot
+already includes a fill. ATLAS therefore keeps a local ledger of its own fills
+(repository.py) and computes, per measure, an expected value:
+
+  expected cash        = checkpoint + sum of ATLAS cash effects since the checkpoint
+  expected qty(SYMBOL) = checkpoint + sum of ATLAS share effects since the checkpoint
+
+and uses the SMALLER of the snapshot value and the expected value:
+
+  cash   = min(non_marginable_buying_power, cash - holds, expected cash - holds)
+  shares = min(qty_available, qty - remaining, expected qty - remaining)
+
+A fresh snapshot equals the expected value (only ATLAS trades the account), so
+nothing is subtracted twice. A snapshot that does not yet show a fill is higher
+than expected, so the ledger bound applies and the fill stays protected.
+
 Decision:
+  measure unverifiable (pre-5.6 data)            -> RECONCILIATION_REQUIRED
   requested > broker available                    -> INSUFFICIENT_* (definitive)
+  requested fits the snapshot but not the ledger  -> RECONCILIATION_REQUIRED
+                                                     (recent executions not reflected yet)
   requested > broker available - local commitments
       and a blocking reservation is uncertain     -> RECONCILIATION_REQUIRED
       otherwise                                   -> RESOURCE_RESERVED (temporary)
@@ -50,8 +70,18 @@ OPEN_ORDERS_PAGE = 500  # Alpaca's maximum page size for GET /v2/orders
 class Capacity:
     resource_type: str        # cash | shares
     symbol: str | None
-    broker_available: Decimal
+    broker_available: Decimal  # from the snapshot and open-order list only
+    proven_available: Decimal  # also bounded by the ATLAS fill ledger
     detail: str
+    unverifiable: bool = False
+
+
+@dataclass(frozen=True)
+class Expected:
+    """Ledger-expected value of a measure. value None = no checkpoint yet (no
+    ATLAS activity on it, so the snapshot is used); unverifiable = cannot be trusted."""
+    value: Decimal | None
+    unverifiable: bool = False
 
 
 def require_complete(open_orders: list[dict[str, Any]]) -> None:
@@ -65,7 +95,8 @@ def _filled_cost(order: dict[str, Any]) -> Decimal:
     return qty * price if qty is not None and price is not None else Decimal(0)
 
 
-def broker_cash(account: dict[str, Any], open_orders: list[dict[str, Any]]) -> Capacity:
+def broker_cash(account: dict[str, Any], open_orders: list[dict[str, Any]],
+                expected: Expected = Expected(None)) -> Capacity:
     nmbp, cash = dec(account.get("non_marginable_buying_power")), dec(account.get("cash"))
     if nmbp is None or cash is None:
         raise PaperError(ErrorCode.BROKER_UNAVAILABLE,
@@ -76,11 +107,17 @@ def broker_cash(account: dict[str, Any], open_orders: list[dict[str, Any]]) -> C
         if order.get("side") == "buy" and notional is not None:
             holds += max(notional - _filled_cost(order), Decimal(0))
     available = min(nmbp, cash - holds)
-    return Capacity("cash", None, available,
-                    f"min(non-marginable buying power {nmbp}, cash {cash} - open buy holds {holds}) = {available}")
+    proven = available if expected.value is None else min(available, expected.value - holds)
+    return Capacity("cash", None, available, proven,
+                    f"min(non-marginable buying power {nmbp}, cash {cash} - open buy holds {holds}"
+                    f"{'' if expected.value is None else f', ledger cash {expected.value} - holds'}) = {proven}",
+                    expected.unverifiable)
 
 
-def broker_shares(position: dict[str, Any] | None, open_orders: list[dict[str, Any]], symbol: str) -> Capacity:
+def broker_shares(position: dict[str, Any] | None, open_orders: list[dict[str, Any]], symbol: str,
+                  expected: Expected = Expected(None)) -> Capacity:
+    if expected.unverifiable:
+        return Capacity("shares", symbol, Decimal(0), Decimal(0), "ledger unverifiable", True)
     if position is None or position.get("side") != "long":
         raise PaperError(ErrorCode.INSUFFICIENT_POSITION,
                          f"There is no long {symbol} position to reduce. Short sales are not allowed.")
@@ -94,8 +131,10 @@ def broker_shares(position: dict[str, Any] | None, open_orders: list[dict[str, A
         if order.get("symbol") == symbol and order.get("side") == "sell" and order_qty is not None:
             held += max(order_qty - (dec(order.get("filled_qty")) or Decimal(0)), Decimal(0))
     available = min(qty_available, qty - held)
-    return Capacity("shares", symbol, available,
-                    f"min(qty_available {qty_available}, qty {qty} - open sell remaining {held}) = {available}")
+    proven = available if expected.value is None else min(available, expected.value - held)
+    return Capacity("shares", symbol, available, proven,
+                    f"min(qty_available {qty_available}, qty {qty} - open sell remaining {held}"
+                    f"{'' if expected.value is None else f', ledger qty {expected.value} - remaining'}) = {proven}")
 
 
 def remaining(row: dict[str, Any]) -> Decimal:
@@ -120,6 +159,10 @@ def local_commitments(rows: list[dict[str, Any]], open_client_ids: set[str],
 def decide(side: Side, requested: Decimal, capacity: Capacity, rows: list[dict[str, Any]],
            open_client_ids: set[str], uncertain: set[str]) -> Check:
     name = "buying_power" if side is Side.BUY else "position"
+    if capacity.unverifiable:
+        raise PaperError(ErrorCode.RECONCILIATION_REQUIRED,
+                         "Earlier executions recorded by a previous version cannot be verified. "
+                         "Check the account in Alpaca before another operation.")
     if requested > capacity.broker_available:
         if side is Side.BUY:
             raise PaperError(ErrorCode.INSUFFICIENT_BUYING_POWER,
@@ -127,7 +170,13 @@ def decide(side: Side, requested: Decimal, capacity: Capacity, rows: list[dict[s
         raise PaperError(ErrorCode.INSUFFICIENT_POSITION,
                          "The quantity exceeds the shares available after open orders.")
     local, has_uncertain = local_commitments(rows, open_client_ids, uncertain)
-    free = capacity.broker_available - local
+    free = capacity.proven_available - local
+    if requested > free and requested <= capacity.broker_available - local:
+        # Only the ledger blocks it: executions ATLAS observed are not yet visible in
+        # the broker snapshot. Retry once the broker balance/position reflects them.
+        raise PaperError(ErrorCode.RECONCILIATION_REQUIRED,
+                         "Recent executions are not yet reflected in the broker balance or position. "
+                         "Check the order status and try again.")
     if requested > free:
         if has_uncertain:
             raise PaperError(ErrorCode.RECONCILIATION_REQUIRED,

@@ -53,9 +53,10 @@ from app.paper.models import (
     Side,
 )
 from app.paper.reconciliation import order_changes, order_matches, to_broker_order
-from app.paper.repository import Repository, consumed_amount
+from app.paper.repository import Repository, consumed_amount, effect, measures_for
 from app.paper.reservations import (
     OPEN_ORDERS_PAGE,
+    Expected,
     broker_cash,
     broker_shares,
     decide,
@@ -180,21 +181,37 @@ class PaperTradingService:
         now = _iso(self._now())
         status = BrokerOrderStatus.parse(order.get("status"))
         terminal = status in TERMINAL_BROKER_STATUSES
+        filled_qty = dec(order.get("filled_qty")) or Decimal(0)
         consumed = consumed_amount(row["side"], order.get("filled_qty"), order.get("filled_avg_price"))
+        filled_notional = consumed_amount("buy", order.get("filled_qty"), order.get("filled_avg_price"))
         reservation = {
             "state": "released" if terminal else "acknowledged",
             "release_reason": "order_terminal" if terminal else None,
             "broker_order_id": order["id"],
             "consumed": str(consumed),
+            "filled_qty": str(filled_qty),
+            "filled_notional": str(filled_notional),
             "updated_at": now,
         }
-        return self.repository.transition(
+
+        def not_older(current: dict) -> bool:
+            # A response never moves fills backwards or reopens a final order.
+            stored_qty = dec(current.get("filled_qty")) or Decimal(0)
+            stored_final = BrokerOrderStatus.parse(current.get("broker_status")) in TERMINAL_BROKER_STATUSES
+            return filled_qty >= stored_qty and (terminal or not stored_final)
+
+        applied = self.repository.transition(
             row["id"], {"submission_status": expected}, order_changes(order, now),
             self._event(row["id"], kind, correlation_id, broker_order_id=order["id"],
                         broker_status=order.get("status"), filled_qty=order.get("filled_qty"),
                         reservation_state=reservation["state"]),
-            reservation_changes=reservation,
+            reservation_changes=reservation, guard=not_older,
         )
+        if not applied:
+            self.repository.add_event(self._event(row["id"], "stale_order_ignored", correlation_id,
+                                                  broker_status=order.get("status"),
+                                                  filled_qty=order.get("filled_qty")))
+        return applied
 
     # --- snapshot and capacity ----------------------------------------------------
 
@@ -204,7 +221,8 @@ class PaperTradingService:
             "account": self._read(client.get_account),
             "clock": self._read(client.get_clock),
             "asset": self._read(lambda: client.get_asset(symbol)),
-            "position": self._read(lambda: client.get_position(symbol)) if side is Side.SELL else None,
+            # Position is read for buys too: buys change the share ledger of the symbol.
+            "position": self._read(lambda: client.get_position(symbol)),
             "open_orders": self._read(lambda: client.list_orders("open", OPEN_ORDERS_PAGE)),
         }
         require_complete(snap["open_orders"])
@@ -220,7 +238,9 @@ class PaperTradingService:
         observation of a final status."""
         client, repo = self._ready()
         by_client_id = {o.get("client_order_id"): o for o in open_orders}
-        for row in repo.active_reservations(*self._resource(side, symbol)):
+        # Every active ATLAS order is refreshed, not only those of this resource: a buy
+        # also changes the share ledger and a sell also changes the cash ledger.
+        for row in repo.all_active_reservations():
             proposal = repo.get_proposal(row["proposal_id"])
             if proposal["submission_status"] == "submitting":
                 continue  # its owner will record the outcome
@@ -231,10 +251,56 @@ class PaperTradingService:
                 self._observe_order(proposal, order, correlation_id, "order_observed",
                                     expected=("submission_unknown", "submitted"))
 
+    @staticmethod
+    def _snapshot_value(snap: dict, measure: str) -> Decimal:
+        if measure == "cash":
+            value = dec(snap["account"].get("cash"))
+            if value is None:
+                raise PaperError(ErrorCode.BROKER_UNAVAILABLE, "The broker did not report cash.")
+            return value
+        position = snap["position"]
+        return (dec(position.get("qty")) or Decimal(0)) if position else Decimal(0)
+
+    def _expected(self, measure: str, conn=None) -> Expected:
+        repo = self.repository
+        rows = [r for r in repo.ledger_rows(conn) if measure in measures_for(r["symbol"])]
+        checkpoint = repo.checkpoint(measure, conn)
+        if checkpoint is None:
+            # No checkpoint is created before the first ATLAS claim on the measure.
+            return Expected(None, unverifiable=bool(rows))
+        if checkpoint["value"] is None:
+            return Expected(None, unverifiable=True)
+        total = sum((effect(r, measure) for r in rows), Decimal(0))
+        return Expected(Decimal(checkpoint["value"]) + total - Decimal(checkpoint["base_effect"]))
+
+    def _prepare_checkpoints(self, conn, symbol: str, snap: dict) -> None:
+        """Inside the claim transaction: create a checkpoint the first time a measure is
+        used, or move it to the snapshot while ATLAS has nothing on that measure
+        (no active reservation and no fill since the checkpoint)."""
+        repo, now = self.repository, _iso(self._now())
+        ledger = repo.ledger_rows(conn)
+        for measure in measures_for(symbol):
+            rows = [r for r in ledger if measure in measures_for(r["symbol"])]
+            total = sum((effect(r, measure) for r in rows), Decimal(0))
+            active = any(r["state"] in ("held", "acknowledged") for r in rows)
+            checkpoint = repo.checkpoint(measure, conn)
+            if checkpoint is None:
+                if rows:
+                    conn.execute("INSERT INTO ledger_checkpoints (measure, value, base_effect, created_at, "
+                                 "updated_at) VALUES (?, NULL, ?, ?, ?)", (measure, str(total), now, now))
+                else:
+                    repo.put_checkpoint(conn, measure, self._snapshot_value(snap, measure), total, now)
+            elif checkpoint["value"] is not None and not active \
+                    and total == Decimal(checkpoint["base_effect"]):
+                repo.put_checkpoint(conn, measure, self._snapshot_value(snap, measure), total, now)
+
     def _capacity_check(self, side: Side, symbol: str, amount: Decimal, snap: dict,
-                        rows: list[dict]) -> Check:
-        capacity = (broker_cash(snap["account"], snap["open_orders"]) if side is Side.BUY
-                    else broker_shares(snap["position"], snap["open_orders"], symbol))
+                        rows: list[dict], conn=None) -> Check:
+        if side is Side.BUY:
+            capacity = broker_cash(snap["account"], snap["open_orders"], self._expected("cash", conn))
+        else:
+            capacity = broker_shares(snap["position"], snap["open_orders"], symbol,
+                                     self._expected(f"qty:{symbol}", conn))
         open_ids = {o.get("client_order_id") for o in snap["open_orders"]}
         now = _iso(self._now())
         uncertain = {r["proposal_id"] for r in rows
@@ -360,10 +426,12 @@ class PaperTradingService:
         now = _iso(now_dt)
         resource_type, symbol = self._resource(side, row["symbol"])
 
-        def recheck(rows: list[dict]) -> None:
-            # Inside the write transaction: other proposals' reservations committed
-            # after our snapshot are visible here and are subtracted.
-            self._capacity_check(side, row["symbol"], amount, snap, rows)
+        def recheck(conn) -> None:
+            # Inside the write transaction: other proposals' reservations and fills
+            # committed after our snapshot are visible here and are accounted for.
+            self._prepare_checkpoints(conn, row["symbol"], snap)
+            rows = repo.active_reservations(resource_type, symbol, conn)
+            self._capacity_check(side, row["symbol"], amount, snap, rows, conn)
 
         try:
             claimed = repo.claim(
@@ -578,6 +646,7 @@ class PaperTradingService:
                 resourceType=latest["resource_type"], symbol=latest["symbol"],
                 amount=Decimal(latest["amount"]), consumed=Decimal(latest["consumed"]),
                 state=latest["state"], releaseReason=latest["release_reason"],
+                filledQty=Decimal(latest["filled_qty"]), filledNotional=Decimal(latest["filled_notional"]),
             )
         return Proposal(
             id=row["id"], environment=row["environment"], symbol=row["symbol"], side=row["side"],
