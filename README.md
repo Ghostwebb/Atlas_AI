@@ -213,6 +213,8 @@ npm run build
   (see Phase 4 below).
 - `POST /api/agents/analyze` with `{ "symbol": "NVDA" }` → four strategy evaluations on one shared
   snapshot (see Phase 7 below).
+- `POST /api/committee/analyze` with `{ "symbol": "NVDA" }` → the agents response plus a deterministic
+  committee reading (see Phase 8 below).
 
 Errors (`400` malformed input, `404` unknown symbol) share one shape:
 
@@ -297,6 +299,25 @@ infinite) are never used: a metric whose window contains one is `null` with an e
 Risk checks that could not run are listed apart (`risksNotEvaluated`); `coverage` only measures the
 scored criteria. Rules, thresholds, contract (`agents.v1.1`) and examples are in
 [docs/phase-7-investment-agents.md](docs/phase-7-investment-agents.md).
+
+## Investment committee (Phase 8)
+
+`POST /api/committee/analyze` compares the four strategy evaluations of one symbol on one snapshot.
+It returns a deterministic reading: `insufficient_data`, `conflicted`, `aligned_unfavorable`,
+`aligned_favorable`, `caution` or `neutral`. The reading comes with:
+
+- the requirements that were or were not met;
+- agreements counted on independent evidence (shared metrics count once), and conflicts;
+- arguments, counterpoints, observed and unevaluated risks, abstentions, missing data, conditions and limitations;
+- references to the published evidence.
+
+AEGIS acts as a risk gate, not as an extra vote. Insufficient agents abstain.
+
+The committee does not invest, does not pick a winning agent, does not average scores and does
+not predict or guarantee returns. It never creates proposals or orders and knows no user
+objective or portfolio. On the synthetic demo dataset no symbol reaches `aligned_favorable`.
+Policy, contract, real examples and the frontend handoff are in
+[docs/phase-8-investment-committee.md](docs/phase-8-investment-committee.md).
 
 ## Later phases
 

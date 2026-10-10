@@ -3,6 +3,7 @@
 Phase 2: demo dataset + deterministic engine. Phase 3: deterministic supervisor.
 Phase 4: optional narrative report via a local LM Studio model (POST /api/report).
 Phase 7: deterministic strategy agents on one shared snapshot (POST /api/agents/analyze).
+Phase 8: deterministic supervised committee over those evaluations (POST /api/committee/analyze).
 """
 
 import os
@@ -18,6 +19,9 @@ from app.agents.models import AgentsAnalyzeRequest, AgentsAnalyzeResponse
 from app.agents.service import analyze_agents
 from app.agents.snapshot import SnapshotIntegrityError
 from app.analysis.service import analyze_symbol
+from app.committee.integrity import CommitteeIntegrityError
+from app.committee.models import CommitteeAnalyzeRequest, CommitteeAnalyzeResponse
+from app.committee.service import analyze_committee
 from app.data.demo_provider import DemoDataProvider
 from app.data.provider import MarketDataProvider
 from app.narration.client import LMStudioClient
@@ -152,6 +156,27 @@ def agents_analyze(payload: AgentsAnalyzeRequest) -> AgentsAnalyzeResponse | JSO
     except (EvidenceIntegrityError, SnapshotIntegrityError):
         body = ErrorResponse(error="Agent evaluation integrity error",
                              message="The strategy evaluations could not be verified and were not produced.")
+        return JSONResponse(status_code=500, content=body.model_dump())
+    if result is None:
+        return _invalid_symbol_response(404)
+    return result
+
+
+@app.post(
+    "/api/committee/analyze",
+    response_model=CommitteeAnalyzeResponse,
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+def committee_analyze(payload: CommitteeAnalyzeRequest) -> CommitteeAnalyzeResponse | JSONResponse:
+    # Only a symbol: no client metrics, evaluations, votes, weights, URLs or recommendations.
+    if not is_valid_format(payload.symbol):
+        return _invalid_symbol_response(400)
+    try:
+        result = analyze_committee(payload.symbol, market_data_provider)
+    except (CommitteeIntegrityError, EvidenceIntegrityError, SnapshotIntegrityError):
+        # Never degrade an integrity failure into a neutral conclusion.
+        body = ErrorResponse(error="Committee integrity error",
+                             message="The committee reading could not be verified and was not produced.")
         return JSONResponse(status_code=500, content=body.model_dump())
     if result is None:
         return _invalid_symbol_response(404)
