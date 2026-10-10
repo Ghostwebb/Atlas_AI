@@ -1,6 +1,11 @@
-"""ATLAS AI backend entrypoint (Phase 2: demo dataset + deterministic engine)."""
+"""ATLAS AI backend entrypoint.
+
+Phase 2: demo dataset + deterministic engine. Phase 3: deterministic supervisor.
+Phase 4: optional narrative report via a local LM Studio model (POST /api/report).
+"""
 
 import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -10,6 +15,10 @@ from fastapi.responses import JSONResponse
 from app.analysis.service import analyze_symbol
 from app.data.demo_provider import DemoDataProvider
 from app.data.provider import MarketDataProvider
+from app.narration.client import LMStudioClient
+from app.narration.config import NarrationSettings, load_settings
+from app.narration.models import ReportRequest, ReportResponse
+from app.narration.service import build_report_response
 from app.schemas import AnalyzeRequest, AnalyzeResponse, ErrorResponse
 from app.supervision.models import SupervisionIntegrityError
 from app.symbols import is_valid_format
@@ -21,7 +30,21 @@ INVALID_SYMBOL_MESSAGE = "Please provide a valid stock symbol."
 # Swap this provider for a real one in later phases; routes do not change.
 market_data_provider: MarketDataProvider = DemoDataProvider()
 
-app = FastAPI(title="ATLAS AI Backend", version="0.2.0")
+# Narration settings are read once at startup; invalid values stop the server.
+narration_settings: NarrationSettings = load_settings()
+narration_client: LMStudioClient | None = (
+    LMStudioClient(narration_settings) if narration_settings.enabled else None
+)
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    yield
+    if narration_client is not None:
+        narration_client.close()
+
+
+app = FastAPI(title="ATLAS AI Backend", version="0.4.0", lifespan=_lifespan)
 
 _allowed_origins = [
     origin.strip()
@@ -41,6 +64,15 @@ app.add_middleware(
 def _invalid_symbol_response(status_code: int) -> JSONResponse:
     body = ErrorResponse(error=INVALID_SYMBOL_ERROR, message=INVALID_SYMBOL_MESSAGE)
     return JSONResponse(status_code=status_code, content=body.model_dump())
+
+
+def _integrity_error_response() -> JSONResponse:
+    # Invalid or inconsistent computed data: no reliable report can be issued.
+    body = ErrorResponse(
+        error="Supervision integrity error",
+        message="The analysis could not be verified and no report was produced.",
+    )
+    return JSONResponse(status_code=500, content=body.model_dump())
 
 
 @app.get("/health")
@@ -69,13 +101,33 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse | JSONResponse:
 
     try:
         result = analyze_symbol(payload.symbol, market_data_provider)
-    except SupervisionIntegrityError as error:
-        # Invalid or inconsistent computed data: no reliable report can be issued.
-        body = ErrorResponse(
-            error="Supervision integrity error",
-            message="The analysis could not be verified and no report was produced.",
+    except SupervisionIntegrityError:
+        return _integrity_error_response()
+    if result is None:
+        return _invalid_symbol_response(404)
+    return result
+
+
+@app.post(
+    "/api/report",
+    response_model=ReportResponse,
+    responses={
+        400: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+def report(payload: ReportRequest) -> ReportResponse | JSONResponse:
+    # The analysis is always computed server-side; clients cannot send metrics.
+    if not is_valid_format(payload.symbol):
+        return _invalid_symbol_response(400)
+    try:
+        result = build_report_response(
+            payload.symbol, payload.language, market_data_provider,
+            narration_settings, narration_client,
         )
-        return JSONResponse(status_code=500, content=body.model_dump())
+    except SupervisionIntegrityError:
+        return _integrity_error_response()
     if result is None:
         return _invalid_symbol_response(404)
     return result
