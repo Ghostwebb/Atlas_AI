@@ -13,8 +13,9 @@ integration**: the visual wiring is a later coordinated PR.
 | `validate.ts` | Runtime validation of every response used to authorize an action |
 | `controller.ts` | Operation controller: state, locks, polling, reconciliation |
 | `usePaperTradingController.ts` | Optional React hook around the controller |
-| `contract.test.mjs`, `controller.test.mjs` | Fixture-only tests (Node test runner) |
-| `run-tests.sh` | Compiles the folder to a temp dir and runs both test files |
+| `contract.test.mjs`, `controller.test.mjs`, `identity-cancel.test.mjs` | Fixture-only tests (Node test runner) |
+| `test-fixtures.mjs` | Shared simulated HTTP fixtures, manual clock and scheduler |
+| `run-tests.sh` | Compiles the folder to a temp dir and runs all test files |
 
 ## Public API
 
@@ -44,7 +45,7 @@ Errors are in `state.lastError` (`code`, `message`, `status`, `correlationId`, `
 `proposal.reservation.state`. On top of them:
 
 - `phase`: a derived summary for the UI.
-- Local flags: `busy`, `reading`, `confirmUncertain`, `cancelUncertain` and `verifying`.
+- Local flags: `busy`, `reading`, `confirmUncertain`, `cancelUncertain`, `verifying` and `suspect`. `suspect` means the last read was malformed or contradicted the operation; mutations stay blocked until a consistent read, while status checks remain available.
 - Polling: `nextReadInMs`.
 - Permissions: `canPrepare`, `canConfirm`, `canCancel` and `canCheckStatus`.
 - Labels: `notice` ("Paper Trading — dinero ficticio") and `source`.
@@ -58,7 +59,7 @@ Errors are in `state.lastError` (`code`, `message`, `status`, `correlationId`, `
 | `review` | `open` + `not_submitted`/`failed_before_submit`, before `expiresAt` | confirm (human), prepare again |
 | `confirming` | `POST /confirm` in flight | — |
 | `uncertain` | Lost/aborted/invalid confirm response, or `submitting` / `submission_unknown` | check status only |
-| `tracking` | `submitted`, broker status not final (incl. `pending_cancel`, `done_for_day`, `replaced`, `unrecognized`) | cancel (human, not while `pending_cancel`), check status |
+| `tracking` | `submitted`, broker status not final (incl. `pending_cancel`, `done_for_day`, `replaced`, `unrecognized`, missing) | check status; cancel (human) only for the statuses in "Cancellation policy" |
 | `final` | Broker `filled`/`canceled`/`expired`/`rejected`, or `rejected_by_broker` | prepare a new one |
 | `expired` | Unsent proposal past its TTL (local clock or backend) | prepare a new one |
 
@@ -79,6 +80,54 @@ Transitions:
 - **`tracking` → `cancel()`.** Any outcome sets `cancelUncertain` until the order is read again, so no second cancel happens on a lost response.
 - **Follow-up reads in `tracking`:** `GET /orders/{brokerOrderId}` (updates ATLAS from Alpaca), then `GET /proposals/{id}` (local state, reservation).
 - **TTL:** only an unsent proposal expires. A submitted operation keeps being followed after `expiresAt`.
+
+## Operation identity
+
+When an operation is adopted (by `prepare` or `resume`), its identity is fixed: `id`,
+`clientOrderId`, `symbol`, `side`, `notional`, `qty` and `analysisReference`.
+
+- **Prepare.** The response must be exactly the requested operation:
+  - the symbol must equal the request symbol after the backend's normalization (`strip()` + `upper()`, as in `backend/app/symbols.py`);
+  - the side must be the same;
+  - a buy needs an equal `notional` and `qty: null`; a sell needs an equal `qty` and `notional: null`;
+  - `analysisReference` must be identical, including its absence.
+- **Exact decimals.** Amounts are compared as canonical decimal strings: leading zeros of the integer part and trailing zeros of the fraction are removed, so `"100.00"` equals `"100"`. There is no `Number`/`parseFloat`, so values that round to the same double stay different.
+- **Later responses.** Every later proposal (confirm, read, reconcile) must keep the same identity. A broker order must match `clientOrderId`, `symbol` and `side`, and its `proposalId` if present.
+- **On a mismatch:**
+  - the error is `INVALID_RESPONSE`;
+  - the response is not adopted;
+  - no mutation is started, and confirm and cancel stay disabled (`suspect`) until a consistent read;
+  - a mismatched confirm response leaves the operation `uncertain` (read and reconcile, never resend).
+
+## Cancellation policy
+
+The button (`canCancel`) is shown only when **all** of these hold:
+
+- `submissionStatus` is `submitted`, a `brokerOrderId` exists, no mutation is in flight, and no cancel or read is uncertain or suspect;
+- the broker status is in the explicit allow-list `CANCELABLE_STATUSES`: `new`, `accepted`, `pending_new`, `accepted_for_bidding`, `partially_filled`.
+
+"Not final" does not mean "cancelable":
+
+| Broker status | Button | Tracking |
+|---|---|---|
+| `new`, `accepted`, `pending_new`, `accepted_for_bidding`, `partially_filled` | shown | yes |
+| unknown (`unrecognized`) or missing | hidden | yes, "Consultar estado" available |
+| `pending_cancel` | hidden | yes (not a final cancel) |
+| `pending_replace` | hidden (Alpaca rejects cancels while replacing) | yes |
+| `done_for_day`, `replaced`, `stopped`, `suspended`, `calculated` | hidden (not a plain live ATLAS order) | yes |
+| `filled`, `canceled`, `expired`, `rejected` | hidden | stops (final) |
+
+Even with the button shown, the backend can answer:
+
+- `409 ORDER_NOT_CANCELABLE` (filled or closed meanwhile);
+- `200` with `order.status: "filled"` (the cancel lost the race);
+- `200` with `pending_cancel`;
+- `404 ORDER_NOT_FOUND`;
+- `503 BROKER_UNAVAILABLE` / `PAPER_DISABLED` / `PAPER_NOT_CONFIGURED`;
+- `403 ORIGIN_NOT_ALLOWED`;
+- `400 INVALID_CONFIRMATION`.
+
+After any outcome the controller reads the order again before offering another cancel.
 
 ## Invariants
 
@@ -137,7 +186,9 @@ LM Studio or credentials. They cover:
 - switching proposals with late responses ignored;
 - malformed or contradictory data;
 - unknown broker statuses;
-- separation between synthetic analysis and the paper account.
+- separation between synthetic analysis and the paper account;
+- operation identity: different symbol, side or amount, an incompatible amount field, the reference (different, missing or unexpected), normalized symbols, equivalent decimals without floats, and later reads or orders that change the operation;
+- the cancellation allow-list: unknown or missing statuses, `pending_cancel`, the four final statuses, allowed statuses, and an unknown status that becomes a recognized one.
 
 Mutation checks run by hand (each one makes at least one test fail):
 
@@ -145,7 +196,12 @@ Mutation checks run by hand (each one makes at least one test fail):
 - retrying an uncertain confirm;
 - treating `pending_cancel` as final;
 - allowing overlapping reads;
-- dropping the stale-response check.
+- dropping the stale-response check;
+- removing the comparison with the request;
+- removing the identity check on later reads;
+- re-enabling cancel for `unrecognized`;
+- comparing amounts with `Number`;
+- not blocking mutations after an invalid read.
 
 Project checks: `./node_modules/.bin/tsc --noEmit -p .`, `npm run lint`, `npm run build`.
 

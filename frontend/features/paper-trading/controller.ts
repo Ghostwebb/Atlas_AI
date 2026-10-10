@@ -8,7 +8,10 @@
 import { PaperApiError, type createPaperClient } from "./client";
 import { PAPER_NOTICE, canCancel as policyCanCancel, canConfirm as policyCanConfirm, isFinalOrder, nextStatusRead } from "./policy";
 import type { BrokerOrder, Proposal } from "./types";
-import { parseCancel, parseOrder, parseProposal, proposalRequest } from "./validate";
+import {
+  assertMatchesRequest, identityOf, parseCancel, parseOrder, parseProposal, proposalRequest, sameIdentity,
+  type OperationIdentity,
+} from "./validate";
 
 export type PaperClient = ReturnType<typeof createPaperClient>;
 
@@ -54,6 +57,9 @@ export interface ControllerState {
   readonly cancelUncertain: boolean;
   /** A definite confirm error was received; the proposal is re-read before confirm is offered again. */
   readonly verifying: boolean;
+  /** The last read was malformed or contradicted the operation's identity: mutations stay blocked
+   *  until a consistent read. Status checks remain available. */
+  readonly suspect: boolean;
   readonly lastError: ControllerError | null;
   /** Delay in ms of the scheduled follow-up read, or null when none is scheduled. */
   readonly nextReadInMs: number | null;
@@ -109,6 +115,9 @@ export function createPaperTradingController(options: ControllerOptions) {
   let confirmUncertain = false;
   let cancelUncertain = false;
   let verifying = false;
+  let suspect = false;
+  // Fixed when the operation is adopted (prepare or resume); later responses must match it.
+  let identity: OperationIdentity | null = null;
   let lastError: ControllerError | null = null;
   let failures = 0;
   let readPromise: Promise<void> | null = null;
@@ -138,12 +147,12 @@ export function createPaperTradingController(options: ControllerOptions) {
     const idleMutations = busy === null && !disposed;
     return Object.freeze({
       notice: PAPER_NOTICE, source, phase: ph, proposal, order, busy,
-      reading: readPromise !== null, confirmUncertain, cancelUncertain, verifying, lastError,
+      reading: readPromise !== null, confirmUncertain, cancelUncertain, verifying, suspect, lastError,
       nextReadInMs: timerDelay,
       canPrepare: idleMutations && ["idle", "review", "expired", "final"].includes(ph),
-      canConfirm: idleMutations && ph === "review" && !verifying && proposal !== null && policyCanConfirm(proposal, now()),
-      canCancel: idleMutations && ph === "tracking" && !cancelUncertain && proposal !== null && policyCanCancel(proposal),
-      canCheckStatus: !disposed && (ph === "uncertain" || ph === "tracking" || verifying || cancelUncertain),
+      canConfirm: idleMutations && ph === "review" && !verifying && !suspect && proposal !== null && policyCanConfirm(proposal, now()),
+      canCancel: idleMutations && ph === "tracking" && !cancelUncertain && !suspect && proposal !== null && policyCanCancel(proposal),
+      canCheckStatus: !disposed && (ph === "uncertain" || ph === "tracking" || verifying || cancelUncertain || suspect),
     });
   }
 
@@ -196,7 +205,17 @@ export function createPaperTradingController(options: ControllerOptions) {
 
   function acceptProposal(p: Proposal, expectedId: string) {
     if (p.id !== expectedId) throw new PaperApiError("La respuesta pertenece a otra propuesta.", "INVALID_RESPONSE");
+    const incoming = identityOf(p);
+    if (identity !== null && !sameIdentity(identity, incoming)) {
+      throw new PaperApiError("La respuesta cambia la operación (símbolo, lado, importe o referencia).", "INVALID_RESPONSE");
+    }
+    identity = incoming;
     proposal = p;
+  }
+
+  /** A broker order belongs to the operation only if its identity fields match. */
+  function orderMatches(o: BrokerOrder, p: Proposal): boolean {
+    return o.clientOrderId === p.clientOrderId && o.symbol === p.symbol && o.side === p.side;
   }
 
   /** One follow-up read. Never confirms, never cancels, never resends. */
@@ -229,7 +248,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     if (!orderId) return;
     const o = parseOrder(await client.order(orderId, signal));
     if (stale()) return;
-    if (o.id !== orderId || (o.proposalId !== null && o.proposalId !== p.id)) {
+    if (o.id !== orderId || (o.proposalId !== null && o.proposalId !== p.id) || !orderMatches(o, p)) {
       throw new PaperApiError("La orden recibida no corresponde a esta operación.", "INVALID_RESPONSE");
     }
     // GET /orders updated ATLAS's records; read them back (SQLite only).
@@ -254,10 +273,12 @@ export function createPaperTradingController(options: ControllerOptions) {
         // A read that leaves the confirmation uncertain also backs off.
         failures = confirmUncertain ? Math.min(failures + 1, 10) : 0;
         lastError = null;
+        suspect = false;
       } catch (error) {
         if (mySession !== session || disposed) return;
         failures = Math.min(failures + 1, 10);
         lastError = toError(error);
+        if (lastError.code === "INVALID_RESPONSE") suspect = true;
       } finally {
         done();
         if (mySession === session && !disposed) {
@@ -280,7 +301,8 @@ export function createPaperTradingController(options: ControllerOptions) {
     for (const c of controllers) c.abort();
     controllers.clear();
     proposal = null; order = null;
-    confirmUncertain = false; cancelUncertain = false; verifying = false;
+    confirmUncertain = false; cancelUncertain = false; verifying = false; suspect = false;
+    identity = null;
     lastError = null; failures = 0;
   }
 
@@ -310,7 +332,9 @@ export function createPaperTradingController(options: ControllerOptions) {
       if (p.status !== "open" || p.submissionStatus !== "not_submitted") {
         throw new PaperApiError("El backend devolvió una propuesta preparada no válida.", "INVALID_RESPONSE");
       }
-      proposal = p;
+      // The prepared proposal must be exactly the requested operation.
+      assertMatchesRequest(p, body);
+      acceptProposal(p, p.id);
       return { ok: true };
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
@@ -381,7 +405,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     try {
       const response = parseCancel(await client.cancel(orderId, signal));
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
-      if (response.order.id !== orderId) throw new PaperApiError("Cancelación contradictoria.", "INVALID_RESPONSE");
+      if (response.order.id !== orderId || !orderMatches(response.order, proposal as Proposal)) throw new PaperApiError("Cancelación contradictoria.", "INVALID_RESPONSE");
       order = response.order; // e.g. pending_cancel (not final) or filled (lost the race)
       lastError = null;
     } catch (error) {

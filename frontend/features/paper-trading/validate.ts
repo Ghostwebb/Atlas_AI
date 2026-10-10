@@ -118,6 +118,54 @@ export function parseCancel(value: unknown): { cancelRequested: true; order: Bro
 }
 
 /**
+ * Exact decimal comparison on strings ("100.00" equals "100", "0.50" equals "0.5").
+ * No Number/parseFloat: values that round to the same double stay different.
+ */
+export function canonicalDecimal(value: string): string {
+  if (!DECIMAL.test(value)) invalid("decimal");
+  const [int, frac = ""] = value.split(".");
+  const i = int.replace(/^0+(?=\d)/, "");
+  const f = frac.replace(/0+$/, "");
+  return f ? `${i}.${f}` : i;
+}
+export const decimalEquals = (a: string, b: string) => canonicalDecimal(a) === canonicalDecimal(b);
+
+/** The backend normalizes symbols with strip() + upper() (backend/app/symbols.py). */
+export const normalizeSymbol = (symbol: string) => symbol.trim().toUpperCase();
+
+/** Fields that define WHAT the operation is. They must never change silently after adoption. */
+export interface OperationIdentity {
+  id: string; clientOrderId: string; symbol: string; side: "buy" | "sell";
+  notional: string | null; qty: string | null; analysisReference: string | null;
+}
+export function identityOf(p: Proposal): OperationIdentity {
+  return {
+    id: p.id, clientOrderId: p.clientOrderId, symbol: p.symbol, side: p.side,
+    notional: p.notional === null ? null : canonicalDecimal(p.notional),
+    qty: p.qty === null ? null : canonicalDecimal(p.qty),
+    analysisReference: p.analysisReference,
+  };
+}
+export function sameIdentity(a: OperationIdentity, b: OperationIdentity): boolean {
+  return a.id === b.id && a.clientOrderId === b.clientOrderId && a.symbol === b.symbol && a.side === b.side &&
+    a.notional === b.notional && a.qty === b.qty && a.analysisReference === b.analysisReference;
+}
+
+/** Throws INVALID_RESPONSE unless the prepared proposal is exactly the requested operation. */
+export function assertMatchesRequest(p: Proposal, request: ProposalRequest): void {
+  if (p.symbol !== normalizeSymbol(request.symbol)) invalid("symbol distinto del solicitado");
+  if (p.side !== request.side) invalid("lado distinto del solicitado");
+  if (request.side === "buy") {
+    if (p.notional === null || !decimalEquals(p.notional, request.notional)) invalid("importe distinto del solicitado");
+    if (p.qty !== null) invalid("cantidad incompatible con una compra");
+  } else {
+    if (p.qty === null || !decimalEquals(p.qty, request.qty)) invalid("cantidad distinta de la solicitada");
+    if (p.notional !== null) invalid("importe incompatible con una venta");
+  }
+  if (p.analysisReference !== (request.analysisReference ?? null)) invalid("analysisReference distinto");
+}
+
+/**
  * Builds the exact request body from user input. Only the documented fields are accepted:
  * analysis objects, recommendations or committee decisions are rejected, never converted.
  */

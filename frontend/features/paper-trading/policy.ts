@@ -21,7 +21,21 @@ export function nextStatusRead(proposal: Proposal):
   return null;
 }
 
-export function canCancel(proposal: Proposal): boolean {
+/**
+ * Broker statuses that show the cancel button. Explicit allow-list: "not final" is NOT "cancelable".
+ * Live orders still waiting for (more) execution. Everything else hides the button but keeps tracking:
+ *   - unknown / missing (`unrecognized`, null), `pending_cancel`: not known to be cancelable;
+ *   - `pending_replace`: Alpaca rejects cancels while replacing;
+ *   - `done_for_day`, `replaced`, `stopped`, `suspended`, `calculated`: not a plain live ATLAS order;
+ *   - `filled`, `canceled`, `expired`, `rejected`: final.
+ * The backend can still answer ORDER_NOT_CANCELABLE (filled meanwhile) or 200 with `filled`.
+ */
+export const CANCELABLE_STATUSES: ReadonlySet<BrokerStatus> = new Set<BrokerStatus>([
+  "new", "accepted", "pending_new", "accepted_for_bidding", "partially_filled",
+]);
+
+export function canCancel(proposal: Pick<Proposal, "submissionStatus" | "brokerOrderId" | "brokerStatus">): boolean {
   return proposal.submissionStatus === "submitted" && Boolean(proposal.brokerOrderId) &&
-    !isFinalOrder(proposal.brokerStatus) && proposal.brokerStatus !== "pending_cancel";
+    proposal.brokerStatus !== null && proposal.brokerStatus !== undefined &&
+    CANCELABLE_STATUSES.has(proposal.brokerStatus);
 }
