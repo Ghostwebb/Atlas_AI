@@ -191,8 +191,10 @@ export ATLAS_NARRATION_ENABLED=true ATLAS_LM_STUDIO_MODEL="<id>"
 It lists the server's models, checks the configured id, generates one narrative, prints
 status, reason and elapsed time, and writes `scripts/manual_lmstudio_result.json`
 (git-ignored). Requirements: LM Studio server running on this machine, a model loaded, and the
-id exported. **Status: not yet run against a real model.** LM Studio was not reachable from
-the development environment, so record the model, settings, time and result when you run it.
+id exported. **Status:** the user reports having generated real reports with Gemma through LM
+Studio on their machine. Claude has not reproduced that run (LM Studio is not reachable from its
+environment); the automated suite uses a mocked transport. Record the model, settings, time and
+result when you run the check.
 
 ## Examples
 

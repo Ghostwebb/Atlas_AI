@@ -8,7 +8,9 @@ analysis (synthetic) ──(user decides; nothing automatic)──┐
                                                          v
 POST /api/paper/proposals   validate, persist, never submit
 POST /api/paper/proposals/{id}/confirm   re-validate, atomic claim + persisted intent, one submit
-GET  /api/paper/proposals/{id} · /orders/{id}   poll the broker status (fills, cancels)
+GET  /api/paper/orders/{id}   read the broker status (fills, cancels); updates the proposal
+POST /api/paper/proposals/{id}/reconcile   read-only lookup for uncertain submissions
+GET  /api/paper/proposals/{id}   local state only (SQLite); never calls the broker
 ```
 
 The model narrative (Gemma) and `/api/analyze` never create, confirm or cancel orders.
@@ -88,11 +90,11 @@ JSON strings; numbers are rejected.
 | `GET /api/paper/positions` | Broker positions (`qty`, `qtyAvailable`, `avgEntryPrice`, `marketValue`) |
 | `GET /api/paper/clock` | `isOpen`, `nextOpen`, `nextClose` |
 | `POST /api/paper/proposals` | Prepare a proposal (201). Never submits |
-| `GET /api/paper/proposals/{id}` | Proposal state (marks it `expired` when due) |
+| `GET /api/paper/proposals/{id}` | Local proposal state from SQLite (marks it `expired` when due). Never calls the broker |
 | `POST /api/paper/proposals/{id}/confirm` | Body `{"confirmation": "CONFIRM_PAPER_ORDER"}`. Validates again and submits once |
 | `POST /api/paper/proposals/{id}/reconcile` | Read-only lookup by `client_order_id` for uncertain submissions |
 | `GET /api/paper/orders?status=open|closed|all&limit=1..100` | Broker orders (default `all`, 50), linked to proposals when created by ATLAS |
-| `GET /api/paper/orders/{orderId}` | Broker status; updates the linked proposal |
+| `GET /api/paper/orders/{orderId}` | Reads the broker status; updates the linked proposal and reservation |
 | `POST /api/paper/orders/{orderId}/cancel` | Body `{"confirmation": "CANCEL_PAPER_ORDER"}`. Requests cancellation |
 
 Proposal request:
@@ -684,8 +686,10 @@ Sell larger than the available position (422):
   flight.
 - `SUBMISSION_UNCERTAIN` or `submissionStatus: "submission_unknown"`: show a clear uncertain
   state with a **Check status** action (`/reconcile`). Never show a resend button.
-- After submission, poll `GET /api/paper/proposals/{id}` or `/orders/{orderId}` (for example
-  every 2–5 s while not terminal) to show `brokerStatus`, `filledQty` and `filledAvgPrice`.
+- After submission, poll `GET /api/paper/orders/{brokerOrderId}` (for example every 2–5 s
+  while not terminal) to show `brokerStatus`, `filledQty` and `filledAvgPrice`.
+  `GET /api/paper/proposals/{id}` only returns what is stored locally and never discovers fills.
+  Full policy: `docs/phase-6-integration-handoff.md` → "Polling policy".
 - Cancel: an explicit button sending `{"confirmation": "CANCEL_PAPER_ORDER"}`. Show the
   returned status (`pending_cancel` is not `canceled`).
 - Send mutating requests from the configured origin. Show `message` and `correlationId` on

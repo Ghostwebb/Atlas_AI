@@ -274,8 +274,9 @@ The recommendation, confidence, metrics and status always come from the determin
 backend. `/api/analyze` never calls the model.
 
 Setup, the full contract, validation limits, frontend guidance and the manual LM Studio check
-are in [docs/phase-4-narration.md](docs/phase-4-narration.md). The check against a real
-model has not been run yet.
+are in [docs/phase-4-narration.md](docs/phase-4-narration.md). The user has generated real
+reports with Gemma through LM Studio on their machine; the automated tests use a mocked transport
+and Claude has not reproduced a real-model run.
 
 ## Paper Trading Lab (Phase 5)
 
@@ -317,7 +318,9 @@ the Phase 5.8 migration below. See `docs/phase-5-paper-trading.md` → "Phase 5.
 migrated to v5 atomically: every checkpoint of a measure with recorded ATLAS fills becomes
 unverifiable (`RECONCILIATION_REQUIRED` until manual recovery). Nothing is deleted, and an audit
 event is added per measure. The frontend integration contract is in
-[docs/phase-6-integration-handoff.md](docs/phase-6-integration-handoff.md).
+[docs/phase-6-integration-handoff.md](docs/phase-6-integration-handoff.md). Note:
+`GET /api/paper/proposals/{id}` returns local state only; follow the broker with
+`GET /api/paper/orders/{orderId}`, or with `POST .../reconcile` for uncertain submissions.
 
 The backend has no authentication: run it locally only. Contract, states, errors, frontend
 guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).
