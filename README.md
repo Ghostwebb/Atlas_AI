@@ -169,6 +169,9 @@ npm run dev          # development, http://localhost:3000
 # or: npm run build && npm start
 ```
 
+The approved dashboard design, the report panel and how the team splits frontend work are
+described in [docs/frontend-collaboration.md](docs/frontend-collaboration.md).
+
 Open http://localhost:3000 and try `NVDA`, `TSLA`, `AAPL`, `MSFT`, `AMZN`, `GOOGL` or `META`.
 Invalid format returns 400. Unknown symbols return 404. Both show a clear error.
 
