@@ -66,7 +66,8 @@ export function fixtureServer({ ignoreAbort = false } = {}) {
     });
   };
   const count = key => calls.filter(c => c === key).length;
-  return { on, transport, calls, urls, unexpected, count };
+  const clear = key => queues.delete(key);
+  return { on, clear, transport, calls, urls, unexpected, count };
 }
 
 export function manualScheduler() {
@@ -89,12 +90,26 @@ export function manualScheduler() {
   };
 }
 
-export function setup(serverOptions) {
-  const server = fixtureServer(serverOptions);
-  const clock = manualScheduler();
+/** journal: null (default, no persistence) or an OperationJournal. Reuse server/clock to simulate a reload. */
+export function setup(serverOptions, { journal = null, server: reuseServer, clock: reuseClock } = {}) {
+  const server = reuseServer ?? fixtureServer(serverOptions);
+  const clock = reuseClock ?? manualScheduler();
   const client = createPaperClient('http://fixture', server.transport);
-  const ctl = createPaperTradingController({ client, source: 'fixture', now: clock.now, scheduler: clock, pollIntervalMs: 3000 });
+  const ctl = createPaperTradingController({ client, journal, source: 'fixture', now: clock.now, scheduler: clock,
+    pollIntervalMs: 3000 });
   return { server, clock, ctl, s: () => ctl.getState() };
+}
+
+/** In-memory Storage double (sessionStorage shape) with failure switches. */
+export function memoryStorage() {
+  const data = new Map();
+  return {
+    failWrites: false, failReads: false,
+    getItem(k) { if (this.failReads) throw new Error('blocked'); return data.has(k) ? data.get(k) : null; },
+    setItem(k, v) { if (this.failWrites) throw new Error('QuotaExceededError'); data.set(k, String(v)); },
+    removeItem(k) { data.delete(k); },
+    raw: data,
+  };
 }
 export const BUY = { symbol: 'NVDA', side: 'buy', notional: '100.00' };
 

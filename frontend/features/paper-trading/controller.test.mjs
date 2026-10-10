@@ -289,3 +289,41 @@ test('paper account data stays separate from synthetic analysis', async () => {
   assert.equal((await fresh.ctl.prepare({ ...BUY, committeeDecision: 'BUY' })).ok, false);
   assert.deepEqual(fresh.server.calls, []);
 });
+
+test('actionError keeps a definite confirm error after the verification read; the next action clears it', async () => {
+  const t = setup();
+  await toReview(t);
+  t.server.on('POST /proposals/p1/confirm', err(409, 'RESOURCE_RESERVED'), ok(submittedFx()));
+  t.server.on('GET /proposals/p1', ok(proposalFx()));
+  await t.ctl.confirm(); await flush();
+  const st = t.s();
+  assert.equal(st.lastError, null); // the verification read succeeded
+  assert.equal(st.actionError.code, 'RESOURCE_RESERVED'); assert.equal(st.actionError.correlationId, 'c-RESOURCE_RESERVED');
+  assert.equal(st.canConfirm, true);
+  const second = t.ctl.confirm();
+  assert.equal(t.s().actionError, null);
+  await second;
+  assert.equal(t.s().phase, 'tracking'); assert.equal(t.s().actionError, null);
+});
+
+test('actionError of a lost confirmation is cleared once the backend resolves the uncertainty', async () => {
+  const t = setup();
+  await toReview(t);
+  t.server.on('POST /proposals/p1/confirm', lost());
+  t.server.on('GET /proposals/p1', ok(proposalFx()), ok(submittedFx()));
+  await t.ctl.confirm(); await flush();
+  assert.equal(t.s().actionError.code, 'NETWORK_ERROR'); assert.equal(t.s().phase, 'uncertain');
+  await t.clock.advance(t.s().nextReadInMs);
+  assert.equal(t.s().phase, 'tracking'); assert.equal(t.s().actionError, null);
+});
+
+test('actionError keeps a cancel error after the follow-up order read', async () => {
+  const t = setup();
+  await toTracking(t);
+  t.server.on('POST /orders/o1/cancel', err(409, 'ORDER_NOT_CANCELABLE'));
+  t.server.on('GET /orders/o1', ok(orderFx({ status: 'filled', filledQty: '1' })));
+  t.server.on('GET /proposals/p1', ok(submittedFx({ brokerStatus: 'filled', filledQty: '1' })));
+  await t.ctl.cancel(); await flush();
+  assert.equal(t.s().phase, 'final'); assert.equal(t.s().lastError, null);
+  assert.equal(t.s().actionError.code, 'ORDER_NOT_CANCELABLE');
+});
