@@ -172,8 +172,10 @@ npm run dev          # development, http://localhost:3000
 Open http://localhost:3000 and try `NVDA`, `TSLA`, `AAPL`, `MSFT`, `AMZN`, `GOOGL` or `META`.
 Invalid format returns 400. Unknown symbols return 404. Both show a clear error.
 
-Configuration (optional): `backend/.env.example` → `ATLAS_CORS_ORIGINS`;
-`frontend/.env.example` → `NEXT_PUBLIC_API_URL`. No credentials are required.
+Configuration (optional): `backend/.env.example` → `ATLAS_CORS_ORIGINS` and the Phase 4
+narration settings; `frontend/.env.example` → `NEXT_PUBLIC_API_URL`. No credentials are
+required. The backend does not load `.env` by itself: export the variables (or
+`set -a; source .env; set +a`) in the shell that starts uvicorn.
 
 ## Tests
 
@@ -187,7 +189,10 @@ scenario, insufficient history and missing fundamentals), the aggregator (BUY / 
 renormalization, confidence), the service contract, and the HTTP API (valid, normalized,
 malformed, unknown and invalid-body requests). Phase 3 adds supervisor tests for each rule,
 exact thresholds, status precedence, data quality and provenance, report wording, and the
-HTTP supervision contract for all seven demo symbols.
+HTTP supervision contract for all seven demo symbols. Phase 4 adds narration tests with a
+mocked HTTP transport (no LM Studio needed): configuration, evidence packet, output validation,
+fallback in both languages, connection/timeout/HTTP/malformed/busy cases and the
+`/api/report` contract.
 
 Frontend checks:
 
@@ -202,6 +207,8 @@ npm run build
 
 - `GET /health` → `{ "status": "ok", "service": "atlas-ai-backend" }`
 - `POST /api/analyze` with `{ "symbol": "NVDA" }` → analysis (see example above).
+- `POST /api/report` with `{ "symbol": "NVDA", "language": "es" }` → `{ analysis, narrative }`
+  (see Phase 4 below).
 
 Errors (`400` malformed input, `404` unknown symbol) share one shape:
 
@@ -249,8 +256,23 @@ Full rules, the evidence policy, status definitions, the confidence meaning, fro
 guidance and real synthetic examples (NVDA, TSLA, a HOLD and an insufficient-history case)
 are in [docs/phase-3-supervisor.md](docs/phase-3-supervisor.md).
 
+## Narrative report (Phase 4)
+
+`POST /api/report` returns the analysis plus a narrative in `es` (default) or `en`. When
+`ATLAS_NARRATION_ENABLED=true`, the narrative is written by a model served locally by
+LM Studio (for example Gemma), at the configured `ATLAS_LM_STUDIO_MODEL`. The backend
+validates the output: strict schema, existing evidence IDs, every supervisor item cited in
+the right section, no digits, no banned phrases, the engine's recommendation only, the
+requested language. Otherwise, or on any model failure (unavailable, timeout, busy, invalid
+output), it returns a deterministic report built from the supervisor, with a reason code.
+The recommendation, confidence, metrics and status always come from the deterministic
+backend. `/api/analyze` never calls the model.
+
+Setup, the full contract, validation limits, frontend guidance and the manual LM Studio check
+are in [docs/phase-4-narration.md](docs/phase-4-narration.md). The check against a real
+model has not been run yet.
+
 ## Later phases
 
-- Phase 4: dashboard charts and the supervision panel.
+- Dashboard charts and the supervision and narrative panels (frontend).
 - Phase 5: validation and offline run.
-- Phase 6 (optional): local Ollama explanations, with the deterministic report as fallback.
