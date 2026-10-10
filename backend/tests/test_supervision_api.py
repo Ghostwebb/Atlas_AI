@@ -35,11 +35,14 @@ def test_supervision_block_has_documented_shape():
     supervision = _analyze("NVDA").json()["supervision"]
     for key in ("schemaVersion", "policyVersion", "status", "engineRecommendation",
                 "dataQuality", "findings", "supportingEvidence", "opposingEvidence",
-                "limitations", "report"):
+                "neutralEvidence", "limitations", "report"):
         assert key in supervision, key
     assert supervision["status"] in ALLOWED_STATUSES
-    assert supervision["schemaVersion"] == "1.0"
-    assert supervision["policyVersion"] == "phase3-v1"
+    assert supervision["schemaVersion"] == "1.1"
+    assert supervision["policyVersion"] == "phase3-v2"
+    assert set(supervision["report"]) == {
+        "headline", "summary", "keyReasons", "counterpoints", "riskFactors", "dataGaps",
+    }
 
 
 def test_supervisor_does_not_alter_engine_recommendation_or_confidence():
@@ -64,13 +67,14 @@ def test_http_responses_are_deterministic():
 
 def test_evidence_references_resolve_against_the_response():
     body = _analyze("NVDA").json()
-    # Dataset references are validated inside supervise(); here we check the
-    # response-level references the frontend will follow.
-    for item in body["supervision"]["supportingEvidence"] + body["supervision"]["opposingEvidence"]:
-        for ref in item["refs"]:
-            if ref.startswith("dataset."):
-                continue
-            assert resolve_reference(body, ref), ref
+    # Every reference must resolve in the final HTTP JSON, with no auxiliary objects.
+    supervision = body["supervision"]
+    refs = [ref for f in supervision["findings"] for ref in f["evidenceRefs"]]
+    for key in ("supportingEvidence", "opposingEvidence", "neutralEvidence"):
+        refs += [ref for item in supervision[key] for ref in item["refs"]]
+    assert refs
+    for ref in refs:
+        assert resolve_reference(body, ref), ref
 
 
 def test_integrity_error_returns_500_with_error_contract(monkeypatch):

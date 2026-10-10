@@ -44,6 +44,7 @@ def integrity_issues(inp: SupervisionInput) -> list[str]:
         "trend.score": inp.trend_score,
         "trend.shortMovingAverage": inp.short_moving_average,
         "trend.longMovingAverage": inp.long_moving_average,
+        "trend.priceVsShortMovingAverage": inp.price_vs_short_ma,
         "risk.score": inp.risk_score,
         "risk.volatility": inp.volatility,
         "risk.maxDrawdown": inp.max_drawdown,
@@ -69,19 +70,37 @@ def integrity_issues(inp: SupervisionInput) -> list[str]:
     if inp.engine_recommendation not in {"BUY", "HOLD", "SELL"}:
         issues.append(f"unknown engine recommendation: {inp.engine_recommendation}")
 
+    # The dataset requirement must be the one the engine applied, otherwise the
+    # history finding and the published counts could contradict the analysis.
+    if inp.dataset.requiredObservations != MIN_BARS_REQUIRED:
+        issues.append(
+            f"dataset requiredObservations={inp.dataset.requiredObservations} "
+            f"differs from the engine requirement {MIN_BARS_REQUIRED}"
+        )
+
     # Internal consistency: a component is available iff its score exists.
     core = {
         "momentum": (inp.momentum_label, inp.momentum_score),
         "trend": (inp.trend_label, inp.trend_score),
         "risk": (inp.risk_label, inp.risk_score),
     }
-    enough_history = inp.dataset.observations >= MIN_BARS_REQUIRED
+    enough_history = inp.dataset.observations >= inp.dataset.requiredObservations
     for name, (label, score) in core.items():
         available = label != "unavailable"
         if available != (score is not None):
             issues.append(f"{name} label and score disagree")
         if not available and enough_history:
             issues.append(f"{name} unavailable although history is sufficient")
+
+    # Metrics that the narrative cites must exist when their component is available.
+    if inp.trend_label != "unavailable" and (
+        inp.short_moving_average is None or inp.long_moving_average is None
+    ):
+        issues.append("trend is available but its moving averages are missing")
+    if inp.momentum_label != "unavailable" and inp.momentum_change_percent is None:
+        issues.append("momentum is available but changePercent is missing")
+    if inp.risk_label != "unavailable" and (inp.volatility is None or inp.max_drawdown is None):
+        issues.append("risk is available but volatility or maxDrawdown is missing")
 
     fundamental_available = inp.fundamental_label != "unavailable"
     if fundamental_available != (inp.fundamental_score is not None):
@@ -141,7 +160,7 @@ def rule_technical_fundamental_divergence(inp: SupervisionInput) -> Finding | No
         severity=Severity.WARNING,
         title="Technical and fundamental signals disagree",
         message=(
-            f"The technical block is {technical_word} while the demo fundamentals are "
+            f"The technical block is {technical_word} while the fundamentals are "
             f"{fundamental_word}."
         ),
         evidenceRefs=[
@@ -183,7 +202,10 @@ def rule_history_insufficient(inp: SupervisionInput) -> Finding | None:
             f"{inp.dataset.observations} observations are available; "
             f"{inp.dataset.requiredObservations} are required for the technical indicators."
         ),
-        evidenceRefs=["dataset.observations", "dataset.requiredObservations"],
+        evidenceRefs=[
+            "supervision.dataQuality.historicalObservations",
+            "supervision.dataQuality.requiredHistoricalObservations",
+        ],
     )
 
 
@@ -208,7 +230,7 @@ def rule_fundamentals_gap(inp: SupervisionInput) -> Finding | None:
                 f"{inp.fundamental_metrics_used} of {EXPECTED_FUNDAMENTAL_METRICS} "
                 "fundamental metrics are available."
             ),
-            evidenceRefs=refs,
+            evidenceRefs=refs + ["supervision.dataQuality.expectedFundamentalMetrics"],
         )
     return None
 

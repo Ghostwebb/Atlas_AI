@@ -83,7 +83,8 @@ def analyze_symbol(symbol: str, provider: MarketDataProvider) -> AnalyzeResponse
         provenance=provenance,
         dataSource=snapshot.data_source,
     )
-    supervision = supervise(response.model_dump(), dataset)
+    # JSON mode: references are validated against what the client will receive.
+    supervision = supervise(response.model_dump(mode="json"), dataset)
     return response.model_copy(update={"supervision": supervision})
 
 

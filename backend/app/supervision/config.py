@@ -4,8 +4,11 @@ Every rule threshold lives here. Changing a value changes the policy, so bump
 POLICY_VERSION when you do.
 """
 
-SCHEMA_VERSION = "1.0"
-POLICY_VERSION = "phase3-v1"
+# 1.1 (additive): EvidenceItem.polarity, SupervisionReport.neutralEvidence,
+# Report.counterpoints. References now resolve against the public response.
+SCHEMA_VERSION = "1.1"
+# phase3-v2: evidence direction is relative to the recommendation (was polarity).
+POLICY_VERSION = "phase3-v2"
 
 # Minimum magnitude for a score to count as a directional signal.
 # Scores in [-1, 1]; |score| < this is treated as neutral (no false conflicts

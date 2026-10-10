@@ -38,6 +38,29 @@ def resolve_reference(view: dict[str, Any], ref: str) -> bool:
     return True
 
 
+def collect_references(report: SupervisionReport) -> list[str]:
+    """All references cited by findings and evidence, in report order."""
+    refs = [ref for f in report.findings for ref in f.evidenceRefs]
+    for item in report.supportingEvidence + report.opposingEvidence + report.neutralEvidence:
+        refs += item.refs
+    return refs
+
+
+def validate_references(public_response: dict[str, Any], report: SupervisionReport) -> None:
+    """Every reference must resolve in the public JSON the client receives.
+
+    `public_response` is the JSON-mode dump of the analysis response. The view
+    adds only the serialized supervision block itself, which is exactly what the
+    HTTP response will contain. No internal objects are added.
+    """
+    view = {**public_response, "supervision": report.model_dump(mode="json")}
+    unresolved = [ref for ref in collect_references(report) if not resolve_reference(view, ref)]
+    if unresolved:
+        raise SupervisionIntegrityError(
+            [f"unresolved evidence reference: {ref}" for ref in unresolved]
+        )
+
+
 def build_input(response_dump: dict[str, Any], dataset: DatasetInfo) -> SupervisionInput:
     """Map an already-computed analysis (as a dict) to the supervisor's input view."""
     analysis = response_dump["analysis"]
@@ -71,6 +94,7 @@ def build_input(response_dump: dict[str, Any], dataset: DatasetInfo) -> Supervis
             fundamental["earningsGrowth"],
         ),
         dataset=dataset,
+        price_vs_short_ma=trend["priceVsShortMovingAverage"],
     )
 
 
@@ -85,6 +109,9 @@ def determine_status(inp: SupervisionInput, findings: list[Finding]) -> Supervis
 def supervise(response_dump: dict[str, Any], dataset: DatasetInfo) -> SupervisionReport:
     """Build the supervision report from an analysis result.
 
+    `response_dump` must be the JSON-mode dump of the public analysis response
+    (`AnalyzeResponse.model_dump(mode="json")`). `dataset` is used for the rules
+    and for the published dataQuality fields only; it is never a reference target.
     Raises SupervisionIntegrityError if inputs are invalid or references do not resolve.
     """
     if dataset.provenance.value != PROVENANCE_BY_DATA_SOURCE.get(dataset.dataSource):
@@ -99,23 +126,13 @@ def supervise(response_dump: dict[str, Any], dataset: DatasetInfo) -> Supervisio
         raise SupervisionIntegrityError(issues)
 
     findings = evaluate_rules(inp)
-    supporting, opposing = build_evidence(inp)
+    supporting, opposing, neutral = build_evidence(inp)
     status = determine_status(inp, findings)
     quality = build_data_quality(inp, status)
     limitations = build_limitations(inp, quality)
-    report = build_report(
-        inp.engine_recommendation, status, findings, supporting, opposing, quality
-    )
+    report = build_report(inp, status, findings, supporting, opposing, neutral, quality)
 
-    # Every reference must point to an existing field of the response or the dataset.
-    view = {**response_dump, "dataset": dataset.model_dump(mode="json")}
-    referenced = [ref for f in findings for ref in f.evidenceRefs]
-    referenced += [ref for item in supporting + opposing for ref in item.refs]
-    unresolved = [ref for ref in referenced if not resolve_reference(view, ref)]
-    if unresolved:
-        raise SupervisionIntegrityError([f"unresolved evidence reference: {ref}" for ref in unresolved])
-
-    return SupervisionReport(
+    supervision = SupervisionReport(
         schemaVersion=SCHEMA_VERSION,
         policyVersion=POLICY_VERSION,
         status=status,
@@ -124,6 +141,9 @@ def supervise(response_dump: dict[str, Any], dataset: DatasetInfo) -> Supervisio
         findings=findings,
         supportingEvidence=supporting,
         opposingEvidence=opposing,
+        neutralEvidence=neutral,
         limitations=limitations,
         report=report,
     )
+    validate_references(response_dump, supervision)
+    return supervision

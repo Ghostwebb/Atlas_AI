@@ -14,14 +14,14 @@ FORBIDDEN_WORDS = ("news", "guarantee", "will rise", "will fall", "predict", "su
 
 def _report_for(inp, status):
     findings = evaluate_rules(inp)
-    supporting, opposing = build_evidence(inp)
+    supporting, opposing, neutral = build_evidence(inp)
     quality = build_data_quality(inp, status)
-    return build_report(inp.engine_recommendation, status, findings, supporting, opposing, quality)
+    return build_report(inp, status, findings, supporting, opposing, neutral, quality)
 
 
 def _all_text(report):
     parts = [report.headline, report.summary]
-    parts += report.keyReasons + report.riskFactors + report.dataGaps
+    parts += report.keyReasons + report.counterpoints + report.riskFactors + report.dataGaps
     return " ".join(parts).lower()
 
 

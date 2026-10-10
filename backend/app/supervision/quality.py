@@ -8,7 +8,6 @@ Two different units are kept apart on purpose:
   intentional; each number is labelled for what it measures.
 """
 
-from app.analysis.config import MIN_BARS_REQUIRED
 from app.supervision.config import (
     COMPONENT_ORDER,
     CORE_TECHNICAL_COMPONENTS,
@@ -57,7 +56,7 @@ def build_data_quality(inp: SupervisionInput, status: SupervisorStatus) -> DataQ
         availableFundamentalMetrics=inp.fundamental_metrics_used,
         expectedFundamentalMetrics=EXPECTED_FUNDAMENTAL_METRICS,
         historicalObservations=inp.dataset.observations,
-        requiredHistoricalObservations=MIN_BARS_REQUIRED,
+        requiredHistoricalObservations=inp.dataset.requiredObservations,
         provenance=Provenance(inp.dataset.provenance),
         firstDate=inp.dataset.firstDate,
         lastDate=inp.dataset.lastDate,
@@ -94,7 +93,7 @@ def build_limitations(inp: SupervisionInput, quality: DataQuality) -> list[Limit
         Limitation(
             code="NON_PREDICTIVE",
             message=(
-                "Rules and thresholds are educational. They describe past demo data "
+                "Rules and thresholds are educational. They describe past data "
                 "and do not predict returns."
             ),
         )

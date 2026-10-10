@@ -25,8 +25,18 @@ class SupervisorStatus(str, Enum):
 
 
 class Direction(str, Enum):
+    """Relation of a signal to the engine recommendation (see evidence.py)."""
+
     SUPPORTING = "supporting"
     OPPOSING = "opposing"
+    NEUTRAL = "neutral"
+
+
+class Polarity(str, Enum):
+    """Market polarity of a signal, independent of the recommendation."""
+
+    FAVORABLE = "favorable"
+    UNFAVORABLE = "unfavorable"
     NEUTRAL = "neutral"
 
 
@@ -66,6 +76,7 @@ class DatasetInfo(_Model):
 
 class EvidenceItem(_Model):
     component: str
+    polarity: Polarity
     direction: Direction
     description: str
     refs: list[str]
@@ -104,6 +115,7 @@ class Report(_Model):
     headline: str
     summary: str
     keyReasons: list[str]
+    counterpoints: list[str]
     riskFactors: list[str]
     dataGaps: list[str]
 
@@ -117,6 +129,7 @@ class SupervisionReport(_Model):
     findings: list[Finding]
     supportingEvidence: list[EvidenceItem]
     opposingEvidence: list[EvidenceItem]
+    neutralEvidence: list[EvidenceItem]
     limitations: list[Limitation]
     report: Report
 
@@ -157,3 +170,6 @@ class SupervisionInput:
     fundamental_raw_values: tuple[float | None, ...]
 
     dataset: DatasetInfo
+
+    # price / SMA20 - 1, as published in analysis.trend.priceVsShortMovingAverage.
+    price_vs_short_ma: float | None = None

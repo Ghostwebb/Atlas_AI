@@ -233,13 +233,21 @@ indicators, and it works offline with no LLM.
   `FUNDAMENTALS_MISSING`, `FUNDAMENTALS_PARTIAL`) and an observation (`LOW_CONFIDENCE`).
 - **Thresholds:** direction threshold 0.20 (inclusive); low confidence below 0.50.
   All values are in `backend/app/supervision/config.py`.
-- **Evidence and quality:** supporting and opposing evidence reference response fields;
-  coverage and provenance are reported in `dataQuality`.
-- **Report:** `headline`, `summary`, `keyReasons`, `riskFactors`, `dataGaps`, built from fixed
-  templates. The output is deterministic.
+- **Evidence (policy `phase3-v2`, schema `1.1`):** each signal has a `polarity`
+  (favorable / unfavorable / neutral) and a `direction` relative to the recommendation
+  (`supportingEvidence`, `opposingEvidence`, `neutralEvidence`). For a SELL, unfavorable
+  signals are the supporting reasons. Risk is a direction only for BUY; for HOLD and SELL it
+  is neutral context, and high risk always appears in `riskFactors`.
+- **References:** every ref resolves in the final HTTP JSON (for example
+  `analysis.trend.shortMovingAverage`, `supervision.dataQuality.historicalObservations`).
+  An unresolved ref is an integrity error (HTTP 500).
+- **Report:** `headline`, `summary`, `keyReasons` (why the recommendation), `counterpoints`
+  (against it), `riskFactors`, `dataGaps`, built from fixed templates. Provenance wording is
+  derived from `dataQuality.provenance`. The output is deterministic.
 
-Full rules, status definitions, the confidence meaning, the API contract for the frontend,
-and a real synthetic example are in [docs/phase-3-supervisor.md](docs/phase-3-supervisor.md).
+Full rules, the evidence policy, status definitions, the confidence meaning, frontend
+guidance and real synthetic examples (NVDA, TSLA, a HOLD and an insufficient-history case)
+are in [docs/phase-3-supervisor.md](docs/phase-3-supervisor.md).
 
 ## Later phases
 
