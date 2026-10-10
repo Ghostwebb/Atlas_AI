@@ -185,7 +185,9 @@ The suite covers: the dataset (presence, OHLCV fields, ordering, determinism, va
 indicator formulas against hand-computed values, each analyzer (including a high-volatility
 scenario, insufficient history and missing fundamentals), the aggregator (BUY / HOLD / SELL,
 renormalization, confidence), the service contract, and the HTTP API (valid, normalized,
-malformed, unknown and invalid-body requests).
+malformed, unknown and invalid-body requests). Phase 3 adds supervisor tests for each rule,
+exact thresholds, status precedence, data quality and provenance, report wording, and the
+HTTP supervision contract for all seven demo symbols.
 
 Frontend checks:
 
@@ -219,12 +221,28 @@ Errors (`400` malformed input, `404` unknown symbol) share one shape:
   verified live over HTTP. Interactive browser testing was not possible in this environment
   (the sandbox blocks browser downloads), so manual UI testing is still recommended.
 
-## Next steps (Phase 3)
+## Supervisor (Phase 3)
 
-1. **Supervisor:** validate analyzer outputs, detect contradictions between signals (for
-   example, positive momentum with a bearish trend), and evaluate evidence quality.
-2. Give contradictions and data gaps their own section in the report, separate from
-   favorable and unfavorable signals.
-3. Tests for contradiction detection and for a deterministic full report.
-4. Later phases: dashboard charts (Phase 4), validation and offline run (Phase 5), optional
-   local Ollama explanations with the deterministic report as fallback (Phase 6).
+`POST /api/analyze` now includes a `supervision` block. It is produced by deterministic
+rules that read the finished analysis. The supervisor does not query data or recompute
+indicators, and it works offline with no LLM.
+
+- **Status:** `insufficient_data` > `caution` > `consistent` (precedence in that order).
+- **Findings:** contradictions (`MOMENTUM_TREND_DIVERGENCE`, `TECHNICAL_FUNDAMENTAL_DIVERGENCE`),
+  a caution (`OPPORTUNITY_RISK_CONFLICT`), data gaps (`HISTORY_INSUFFICIENT`,
+  `FUNDAMENTALS_MISSING`, `FUNDAMENTALS_PARTIAL`) and an observation (`LOW_CONFIDENCE`).
+- **Thresholds:** direction threshold 0.20 (inclusive); low confidence below 0.50.
+  All values are in `backend/app/supervision/config.py`.
+- **Evidence and quality:** supporting and opposing evidence reference response fields;
+  coverage and provenance are reported in `dataQuality`.
+- **Report:** `headline`, `summary`, `keyReasons`, `riskFactors`, `dataGaps`, built from fixed
+  templates. The output is deterministic.
+
+Full rules, status definitions, the confidence meaning, the API contract for the frontend,
+and a real synthetic example are in [docs/phase-3-supervisor.md](docs/phase-3-supervisor.md).
+
+## Later phases
+
+- Phase 4: dashboard charts and the supervision panel.
+- Phase 5: validation and offline run.
+- Phase 6 (optional): local Ollama explanations, with the deterministic report as fallback.
