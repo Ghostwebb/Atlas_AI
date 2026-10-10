@@ -310,9 +310,14 @@ Order observations are monotonic. Pre-5.6 local data is marked unverifiable. See
 **Phase 5.7 (checkpoints):** a zero net effect is not proof that no fills happened. A checkpoint follows
 the broker snapshot only while ATLAS has never observed a fill on that measure and has nothing
 active on it. After the first ATLAS fill it never moves again, so availability stays bounded by the
-ledger and increases made outside ATLAS are not used (conservative). Phase 5.6 databases are
-migrated (v3 → v4): checkpoints moved after fills become unverifiable. See
-`docs/phase-5-paper-trading.md` → "Phase 5.7".
+ledger and increases made outside ATLAS are not used (conservative). Older databases are repaired by
+the Phase 5.8 migration below. See `docs/phase-5-paper-trading.md` → "Phase 5.7".
+
+**Phase 5.8 (repair):** dates do not prove a checkpoint is safe. Databases written at v3 or v4 are
+migrated to v5 atomically: every checkpoint of a measure with recorded ATLAS fills becomes
+unverifiable (`RECONCILIATION_REQUIRED` until manual recovery). Nothing is deleted, and an audit
+event is added per measure. The frontend integration contract is in
+[docs/phase-6-integration-handoff.md](docs/phase-6-integration-handoff.md).
 
 The backend has no authentication: run it locally only. Contract, states, errors, frontend
 guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).

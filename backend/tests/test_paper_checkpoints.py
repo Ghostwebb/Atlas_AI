@@ -222,12 +222,13 @@ def test_migration_from_phase56_distrusts_moved_checkpoints_with_fills(tmp_path)
         conn.execute("UPDATE ledger_checkpoints SET value = '2', updated_at = 'later' WHERE measure = 'qty:NVDA'")
         conn.execute("INSERT INTO ledger_checkpoints VALUES ('qty:AAPL', '1', '0', 't0', 'later')")
         conn.execute("PRAGMA user_version = 3")
-    repo = Repository(path)                                          # migrates 3 -> 4
+    repo = Repository(path)                                          # migrates 3 -> 5
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert repo.checkpoint("qty:NVDA")["value"] is None              # moved + fills: distrusted
-    assert repo.checkpoint("cash")["value"] == "200"                 # never moved: kept
-    assert repo.checkpoint("qty:AAPL")["value"] == "1"               # moved but no fills: kept
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert repo.checkpoint("qty:NVDA")["value"] is None              # fills recorded: distrusted
+    # Phase 5.8: dates prove nothing, so "never moved" is not trusted either; cash has fills.
+    assert repo.checkpoint("cash")["value"] is None
+    assert repo.checkpoint("qty:AAPL")["value"] == "1"               # no fills on this measure: kept
     restarted = PaperTradingService(settings(), broker, repo, now=Clock())
     assert attempt(restarted, sell("1")) == "RECONCILIATION_REQUIRED"
     assert sells(broker) == []

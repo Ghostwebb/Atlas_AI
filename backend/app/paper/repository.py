@@ -18,9 +18,12 @@ Schema versions (PRAGMA user_version):
   2    Phase 5.5: reservations table, submit lease columns, conservative backfill
   3    Phase 5.6: cumulative fills per reservation (filled_qty, filled_notional) and
        ledger_checkpoints. Measures touched by pre-5.6 rows are marked unverifiable.
-  4    Phase 5.7 (data only): a 5.6 checkpoint that was ever moved, on a measure that
-       has ATLAS fills, may have adopted a stale snapshot (net-zero rule). It is marked
-       unverifiable. Checkpoints never moved after creation are kept.
+  4    Phase 5.7 (data only): tried to distrust 5.6 checkpoints by comparing dates.
+       That was insufficient: a checkpoint can change while keeping equal dates.
+  5    Phase 5.8 (data only, repair): in any database written at v3 or v4, every
+       checkpoint of a measure with recorded ATLAS fills is marked unverifiable,
+       whatever its dates. Neither dates nor values prove that such a checkpoint
+       kept a trustworthy value. Measures without fills keep their checkpoints.
 
 Ledger (Phase 5.6). Each ATLAS fill changes two measures:
   buy   cash -filled_notional, qty:<SYMBOL> +filled_qty
@@ -32,12 +35,13 @@ value NULL means unverifiable: operations depending on it are blocked.
 
 import json
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS proposals (
@@ -208,8 +212,10 @@ class Repository:
                     if statement.strip():
                         conn.execute(statement)
                 self._backfill_ledger(conn)
-            if version == 3:
-                self._distrust_moved_checkpoints(conn)
+            if version < 5:
+                # Runs for v3 and v4 databases (and harmlessly for older ones, whose
+                # touched measures the v3 backfill already made unverifiable).
+                self._distrust_filled_checkpoints(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -254,7 +260,13 @@ class Repository:
                     "VALUES (?, NULL, '0', ?, ?)", (measure, row["updated_at"], row["updated_at"]))
 
     @staticmethod
-    def _distrust_moved_checkpoints(conn: sqlite3.Connection) -> None:
+    def _distrust_filled_checkpoints(conn: sqlite3.Connection) -> None:
+        """Mark unverifiable every checkpoint of a measure with recorded ATLAS fills.
+
+        A fill on any symbol changes `cash` and `qty:<SYMBOL>`. The fill HISTORY is
+        used (any non-zero cumulative filled_qty / filled_notional), never the net
+        effect, and never dates. Nothing is deleted; one audit event per measure.
+        """
         filled_measures: set[str] = set()
         for row in conn.execute(
             "SELECT p.symbol, r.filled_qty, r.filled_notional FROM reservations r "
@@ -262,12 +274,18 @@ class Repository:
         ).fetchall():
             if Decimal(row["filled_qty"]) != 0 or Decimal(row["filled_notional"]) != 0:
                 filled_measures.update(measures_for(row["symbol"]))
+        now = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         for checkpoint in conn.execute(
-            "SELECT measure FROM ledger_checkpoints WHERE value IS NOT NULL AND updated_at != created_at"
+            "SELECT measure, value FROM ledger_checkpoints WHERE value IS NOT NULL ORDER BY measure"
         ).fetchall():
             if checkpoint["measure"] in filled_measures:
-                conn.execute("UPDATE ledger_checkpoints SET value = NULL WHERE measure = ?",
-                             (checkpoint["measure"],))
+                conn.execute("UPDATE ledger_checkpoints SET value = NULL, updated_at = ? WHERE measure = ?",
+                             (now, checkpoint["measure"]))
+                Repository._event(conn, {
+                    "proposal_id": None, "at": now, "type": "checkpoint_distrusted",
+                    "data": {"measure": checkpoint["measure"], "previous_value": checkpoint["value"],
+                             "reason": "pre-v5 checkpoint on a measure with ATLAS fills"},
+                })
 
     # --- ledger --------------------------------------------------------------
 

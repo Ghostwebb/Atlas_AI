@@ -245,7 +245,7 @@ that updates the proposal and its reservation in the same transaction.
 ### Confirmation flow
 
 ```text
-read broker: account, clock, asset, position (sells), open orders (status=open, limit 500)
+read broker: account, clock, asset, position (buys and sells since 5.6), open orders (status=open, limit 500)
 static checks; refresh known commitments from the fresh open-order list / per-order reads
 BEGIN IMMEDIATE
   proposal open, not expired, not yet submitted         (conditional UPDATE)
@@ -310,7 +310,7 @@ Nothing is deleted or recreated, and the migration runs once.
 | `RECONCILIATION_REQUIRED` | 409 | "Debes consultar el estado antes de intentar otra operación" |
 
 `proposal.reservation` (additive) shows `resourceType`, `symbol`, `amount`, `consumed`, `state`
-and `releaseReason`. There is no endpoint that forces the release of a reservation.
+and `releaseReason`, plus `filledQty` and `filledNotional` since Phase 5.6. There is no endpoint that forces the release of a reservation.
 
 Real backend output with the fake broker:
 
@@ -503,12 +503,45 @@ Consequences:
 This is conservative, not unsafe, and there is deliberately no override. Before any ATLAS fill on a
 measure, the checkpoint keeps following the snapshot.
 
-### Migration (`user_version` 3 → 4, data only)
+### Migration (`user_version` 3 → 4, data only) — superseded by Phase 5.8
 
-A 5.6 checkpoint that was ever moved (`updated_at != created_at`) on a measure with ATLAS fills may
-have adopted a stale snapshot. It is set to unverifiable (`value NULL` →
-`RECONCILIATION_REQUIRED`), with the same documented recovery as Phase 5.6. Checkpoints never moved,
-or on measures without fills, are kept. The schema is unchanged.
+It distrusted 5.6 checkpoints by comparing `updated_at` with `created_at`. That was insufficient
+(see Phase 5.8) and has been replaced.
+
+## Phase 5.8: repair of v3 and v4 databases
+
+### Defect fixed
+
+Dates cannot prove that a checkpoint kept its initial value. With a fixed clock, a 5.6 checkpoint
+inflated from 1 to 2 shares kept `created_at == updated_at`, so the 5.7 migration left it trusted.
+After a restart ATLAS allowed selling 2 shares when only 1 existed.
+
+| Reproduction (fake broker, fixed clock) | Before (`2718311`) | After |
+|---|---|---|
+| v3 database: real position 1, checkpoint `qty:NVDA` = 2, equal dates, frozen snapshot 2; migrate, restart, sell 2 | Checkpoint kept at 2, sale of 2 **sent** | `qty:NVDA` and `cash` unverifiable, `RECONCILIATION_REQUIRED`, **0** new submissions |
+| Same database already at v4 | Same over-commitment | Repaired by v5, same result |
+
+### Repair policy (`user_version` → 5, data only, atomic and idempotent)
+
+For any database written at v3 or v4, **every** checkpoint of a measure with recorded ATLAS fills
+becomes unverifiable (`value NULL`), whatever its dates or value:
+- A fill on any symbol touches both `cash` and `qty:<SYMBOL>`. In practice, after any ATLAS fill,
+  `cash` and the share measure of each traded symbol are blocked.
+- The persisted fill history (`filled_qty` / `filled_notional` ≠ 0) is used, never the net effect.
+- Measures without recorded fills keep their checkpoints. They are safe under the existing rule:
+  no ATLAS fill can be missing from their snapshot.
+- Checkpoints that were already unverifiable stay so.
+- One `checkpoint_distrusted` audit event per measure records the previous value.
+- Proposals, reservations, fills and earlier events are never deleted.
+- The migration runs in one transaction (a failure leaves the file at its previous version) and
+  runs once (`PRAGMA user_version`).
+
+There is no persisted information that could separate a safe v4 checkpoint (created by 5.7 code)
+from one contaminated under 5.6. So v4 databases with fills are blocked too. **Additional
+restriction:** operations on those measures return `RECONCILIATION_REQUIRED` until manual
+recovery: check in the Alpaca dashboard that no orders are open, then start a new local database
+(`backend/var/paper_trading.sqlite3`). There is no endpoint or button to override it. Databases
+created at v5 are not affected.
 
 ## Audit trail
 
@@ -516,7 +549,7 @@ The SQLite `events` table records `proposal_created`, `validation_failed`, `subm
 `broker_accepted`, `broker_rejected`, `submission_not_sent`, `submission_unknown`,
 `reconciled`, `reconcile_not_found`, `recovered_after_restart`, `order_status`,
 `proposal_expired`, `cancel_requested`, `cancel_rejected`, `cancel_result`, `order_observed`,
-`submission_lease_expired`, `reservation_backfilled` and `stale_order_ignored`, with ids,
+`submission_lease_expired`, `reservation_backfilled`, `stale_order_ignored` and `checkpoint_distrusted`, with ids,
 timestamps, states, amounts and the correlation id. No secrets and no narrative text are stored.
 
 ## Examples

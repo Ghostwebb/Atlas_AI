@@ -378,7 +378,7 @@ def test_22_migrates_a_phase5_database_conservatively(tmp_path):
     _phase5_database(path)
     repo = Repository(path)
     with sqlite3.connect(path) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4   # 5.5 (v2), 5.6 (v3), 5.7 (v4)
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 5   # 5.5 (v2), 5.6 (v3), 5.7 (v4), 5.8 (v5)
         assert conn.execute("SELECT COUNT(*) FROM proposals").fetchone()[0] == 5
         # Phase 5.6: measures touched by pre-5.6 rows have no trusted baseline.
         unverifiable = {r[0] for r in conn.execute("SELECT measure FROM ledger_checkpoints WHERE value IS NULL")}
