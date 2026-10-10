@@ -11,6 +11,7 @@ from app.analysis.fundamental import FundamentalResult, analyze_fundamentals
 from app.analysis.narrative import build_explanation, build_summary
 from app.analysis.risk import RiskResult, analyze_risk
 from app.analysis.technical import MomentumResult, TrendResult, analyze_momentum, analyze_trend
+from app.analysis.config import MIN_BARS_REQUIRED
 from app.data.provider import MarketDataProvider
 from app.schemas import (
     AnalysisDetails,
@@ -21,6 +22,9 @@ from app.schemas import (
     Signals,
     TrendAnalysis,
 )
+from app.supervision.config import PROVENANCE_BY_DATA_SOURCE
+from app.supervision.models import DatasetInfo, SupervisionIntegrityError
+from app.supervision.service import supervise
 
 
 def analyze_symbol(symbol: str, provider: MarketDataProvider) -> AnalyzeResponse | None:
@@ -45,7 +49,7 @@ def analyze_symbol(symbol: str, provider: MarketDataProvider) -> AnalyzeResponse
         }
     )
 
-    return AnalyzeResponse(
+    response = AnalyzeResponse(
         symbol=snapshot.symbol,
         companyName=snapshot.company_name,
         recommendation=result.recommendation,
@@ -63,6 +67,25 @@ def analyze_symbol(symbol: str, provider: MarketDataProvider) -> AnalyzeResponse
         dataAsOf=snapshot.as_of.isoformat() if snapshot.as_of else None,
         dataIssues=snapshot.data_issues,
     )
+
+    # Phase 3: the supervisor reads the finished result and the dataset facts.
+    # It does not query the provider or recompute indicators.
+    provenance = PROVENANCE_BY_DATA_SOURCE.get(snapshot.data_source)
+    if provenance is None:
+        raise SupervisionIntegrityError(
+            [f"no provenance mapping for data source '{snapshot.data_source}'"]
+        )
+    dataset = DatasetInfo(
+        observations=len(snapshot.bars),
+        requiredObservations=MIN_BARS_REQUIRED,
+        firstDate=snapshot.bars[0].date.isoformat() if snapshot.bars else None,
+        lastDate=snapshot.as_of.isoformat() if snapshot.as_of else None,
+        provenance=provenance,
+        dataSource=snapshot.data_source,
+    )
+    # JSON mode: references are validated against what the client will receive.
+    supervision = supervise(response.model_dump(mode="json"), dataset)
+    return response.model_copy(update={"supervision": supervision})
 
 
 def _signals(

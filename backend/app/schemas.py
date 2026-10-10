@@ -10,6 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.supervision.models import SupervisionReport
 from app.symbols import normalize_symbol
 
 
@@ -83,6 +84,9 @@ class AnalyzeResponse(BaseModel):
     dataSource: str
     dataAsOf: str | None
     dataIssues: list[str]
+    # Additive in Phase 3. Always present in analyze responses; optional only so
+    # the analysis can be built before the supervisor runs.
+    supervision: SupervisionReport | None = None
 
 
 class ErrorResponse(BaseModel):

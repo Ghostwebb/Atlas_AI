@@ -34,7 +34,7 @@ def make_snapshot(
         company_name=company_name,
         bars=bars_from_closes(closes),
         fundamentals=fundamentals,
-        data_source="test_fixture",
+        data_source="demo_dataset",  # hand-built synthetic fixture; must map to a provenance
         is_simulated=True,
     )
 

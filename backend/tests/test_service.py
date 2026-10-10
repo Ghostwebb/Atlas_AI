@@ -20,7 +20,7 @@ def test_result_contract_is_complete_for_demo_symbol():
     assert set(body) == {
         "symbol", "companyName", "recommendation", "confidence", "summary",
         "explanation", "signals", "analysis", "isSimulated", "dataSource",
-        "dataAsOf", "dataIssues",
+        "dataAsOf", "dataIssues", "supervision",  # supervision is the additive Phase 3 field
     }
     assert set(body["signals"]) == {"momentum", "risk", "trend", "fundamental"}
     assert set(body["analysis"]) == {"momentum", "trend", "risk", "fundamental"}

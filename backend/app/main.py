@@ -11,6 +11,7 @@ from app.analysis.service import analyze_symbol
 from app.data.demo_provider import DemoDataProvider
 from app.data.provider import MarketDataProvider
 from app.schemas import AnalyzeRequest, AnalyzeResponse, ErrorResponse
+from app.supervision.models import SupervisionIntegrityError
 from app.symbols import is_valid_format
 
 SERVICE_NAME = "atlas-ai-backend"
@@ -66,7 +67,15 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse | JSONResponse:
     if not is_valid_format(payload.symbol):
         return _invalid_symbol_response(400)
 
-    result = analyze_symbol(payload.symbol, market_data_provider)
+    try:
+        result = analyze_symbol(payload.symbol, market_data_provider)
+    except SupervisionIntegrityError as error:
+        # Invalid or inconsistent computed data: no reliable report can be issued.
+        body = ErrorResponse(
+            error="Supervision integrity error",
+            message="The analysis could not be verified and no report was produced.",
+        )
+        return JSONResponse(status_code=500, content=body.model_dump())
     if result is None:
         return _invalid_symbol_response(404)
     return result
