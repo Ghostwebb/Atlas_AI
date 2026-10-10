@@ -242,7 +242,7 @@ def test_justified_disagreement_on_one_snapshot():
 def test_weights_and_versions():
     C.validate_config()
     assert [s.id for s in REGISTRY] == ["argo", "nova", "vector", "aegis"]
-    assert all(s.version == "1.0.0" for s in REGISTRY)
+    assert all(s.version == "1.0.1" for s in REGISTRY)
     for s in REGISTRY:
         assert abs(sum(c.weight for c in s.criteria) - 1.0) < 1e-9 and any(c.core for c in s.criteria)
 

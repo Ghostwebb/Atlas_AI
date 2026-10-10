@@ -41,14 +41,14 @@ def test_every_demo_symbol_is_evaluated_by_the_four_strategies(symbol, no_outbou
     response = post({"symbol": symbol})
     assert response.status_code == 200
     body = response.json()
-    assert body["schemaVersion"] == "agents.v1"
+    assert body["schemaVersion"] == "agents.v1.1"
     assert [e["strategyId"] for e in body["evaluations"]] == ["argo", "nova", "vector", "aegis"]
     assert body["snapshot"]["provenance"] == "synthetic" and body["snapshot"]["isSimulated"] is True
     assert "synthetic" in body["notice"] and "not orders" in body["notice"]
     for e in body["evaluations"]:
         assert e["status"] in ("complete", "partial", "insufficient")
         assert e["stance"] in ("favorable", "neutral", "unfavorable", "insufficient_data")
-        assert e["version"] == "1.0.0" and 0 <= e["coverage"] <= 1
+        assert e["version"] == "1.0.1" and 0 <= e["coverage"] <= 1
     validate_references(body)
     assert no_outbound == []
 
@@ -165,3 +165,23 @@ def test_existing_analyze_and_report_are_unchanged(no_outbound):
     assert client.post("/api/analyze", json={"symbol": "NVDA"}).json() == analyze_before
     assert client.post("/api/report", json={"symbol": "NVDA"}).json() == report_before
     assert analyze_before["recommendation"] == "BUY" and "agents" not in analyze_before
+
+
+# Results on the healthy demo dataset (unchanged by the input-validity fix of 632f951).
+EXPECTED = {
+    "AAPL": [("neutral", -0.2), ("neutral", 0.3), ("unfavorable", -0.85), ("neutral", 0.0)],
+    "MSFT": [("neutral", -0.2), ("neutral", 0.6), ("neutral", 0.0), ("favorable", 0.5)],
+    "NVDA": [("neutral", -0.2), ("favorable", 1.0), ("favorable", 0.85), ("neutral", -0.2)],
+    "TSLA": [("unfavorable", -0.7), ("unfavorable", -0.7), ("unfavorable", -0.85), ("unfavorable", -0.85)],
+    "AMZN": [("unfavorable", -0.5), ("neutral", 0.3), ("unfavorable", -0.85), ("neutral", -0.15)],
+    "GOOGL": [("neutral", 0.3), ("neutral", 0.3), ("neutral", 0.0), ("favorable", 0.85)],
+    "META": [("neutral", -0.2), ("favorable", 1.0), ("unfavorable", -0.85), ("neutral", 0.0)],
+}
+
+
+@pytest.mark.parametrize("symbol", SYMBOLS)
+def test_healthy_demo_results_are_unchanged(symbol):
+    body = post({"symbol": symbol}).json()
+    assert [(e["stance"], e["score"]) for e in body["evaluations"]] == EXPECTED[symbol]
+    assert all(m["status"] == "ok" and m["issue"] is None for m in body["snapshot"]["metrics"].values())
+    assert all(e["risksNotEvaluated"] == [] and e["notEvaluated"] == [] for e in body["evaluations"])

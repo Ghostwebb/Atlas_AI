@@ -21,7 +21,9 @@ class AgentsAnalyzeRequest(_Strict):
 
 
 class MetricOut(_Strict):
-    value: float | None = Field(..., description="null = unavailable (never 0)")
+    value: float | None = Field(..., description="null = unavailable (never 0); see status")
+    status: Literal["ok", "missing", "insufficient_history", "invalid_input", "not_computable"]
+    issue: str | None = Field(..., description="Cause when status is not ok (affected window, first date)")
     unit: Literal["decimal", "multiple", "usd", "ratio"]
     source: Literal["price_bars", "fundamentals"]
     window: str | None
@@ -60,11 +62,14 @@ class EvidenceItem(_Strict):
     references: list[Reference]
 
 
+Unavailable = Literal["missing", "insufficient_history", "invalid_input", "not_computable"]
+
+
 class NotEvaluatedItem(_Strict):
     id: str
     criterion: str
     label: str
-    reason: Literal["missing", "not_interpretable"]
+    reason: Literal["missing", "insufficient_history", "invalid_input", "not_computable", "not_interpretable"]
     weight: float
     core: bool
     statement: str
@@ -73,6 +78,13 @@ class NotEvaluatedItem(_Strict):
 
 class RiskItem(_Strict):
     id: str
+    statement: str
+    references: list[Reference]
+
+
+class RiskNotEvaluatedItem(_Strict):
+    id: str
+    reason: Unavailable
     statement: str
     references: list[Reference]
 
@@ -94,16 +106,18 @@ class StrategyEvaluation(_Strict):
     stance: Literal["favorable", "neutral", "unfavorable", "insufficient_data"]
     score: float | None = Field(..., ge=-1, le=1, description="Weighted mean of criterion points in [-1, 1]")
     coverage: float = Field(..., ge=0, le=1,
-                            description="Share of the strategy's criterion weight that could be evaluated")
+                            description="Share of the weight of the SCORED criteria that could be evaluated; "
+                                        "it does not cover risk checks (see risksNotEvaluated)")
     evidence: Evidence
     notEvaluated: list[NotEvaluatedItem]
     risks: list[RiskItem]
+    risksNotEvaluated: list[RiskNotEvaluatedItem]
     missingData: list[str]
     limitations: list[str]
 
 
 class AgentsAnalyzeResponse(_Strict):
-    schemaVersion: Literal["agents.v1"]
+    schemaVersion: Literal["agents.v1.1"]
     notice: str
     snapshot: SnapshotOut
     evaluations: list[StrategyEvaluation]

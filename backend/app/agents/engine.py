@@ -1,7 +1,7 @@
 """Pure evaluation of a strategy over a shared snapshot, plus reference validation."""
 
 from app.agents.config import STANCE_BAND
-from app.agents.snapshot import AgentSnapshot
+from app.agents.snapshot import _SEVERITY, AgentSnapshot
 from app.agents.strategies import POINTS, Assessment, Strategy
 
 METRICS_PATH = "snapshot.metrics."
@@ -16,6 +16,21 @@ def _ref(snapshot: AgentSnapshot, metric_id: str) -> dict:
     return {"path": METRICS_PATH + metric_id, "value": metric.value, "unit": metric.unit}
 
 
+def _unavailable(snapshot: AgentSnapshot, metric_ids) -> list[str]:
+    return [m for m in metric_ids if snapshot.metrics[m].value is None]
+
+
+def _cause(snapshot: AgentSnapshot, absent: list[str]) -> str:
+    """Most severe publication status among the unavailable inputs (invalid > not computable >
+    insufficient history > missing)."""
+    return max((snapshot.metrics[m].status for m in absent), key=lambda status: _SEVERITY[status])
+
+
+def _describe(snapshot: AgentSnapshot, absent: list[str]) -> str:
+    return "; ".join(f"{m} {snapshot.metrics[m].status}" + (f" ({snapshot.metrics[m].issue})"
+                                                            if snapshot.metrics[m].issue else "") for m in absent)
+
+
 def evaluate(strategy: Strategy, snapshot: AgentSnapshot) -> dict:
     values = {key: metric.value for key, metric in snapshot.metrics.items()}
     evidence = {"favorable": [], "unfavorable": [], "neutral": []}
@@ -26,10 +41,11 @@ def evaluate(strategy: Strategy, snapshot: AgentSnapshot) -> dict:
     core_directions: list[str | None] = []
 
     for criterion in strategy.criteria:
-        absent = [m for m in criterion.metrics if values.get(m) is None]
+        absent = _unavailable(snapshot, criterion.metrics)
         if absent:
+            # Absence propagates: an unavailable input never yields a direction or a 0.
             missing.update(absent)
-            assessment = Assessment(None, "missing", "Not evaluated: missing " + ", ".join(absent) + ".")
+            assessment = Assessment(None, _cause(snapshot, absent), "Not evaluated: " + _describe(snapshot, absent) + ".")
         else:
             assessment = criterion.assess(values)
         refs = [_ref(snapshot, m) for m in criterion.metrics]
@@ -59,8 +75,15 @@ def evaluate(strategy: Strategy, snapshot: AgentSnapshot) -> dict:
         else:
             stance = "neutral"
 
-    risks = []
+    risks, risks_not_evaluated = [], []
     for rule in strategy.risks:
+        absent = _unavailable(snapshot, rule.metrics)
+        if absent:
+            # "Could not check" is reported as such: never as "no risk" and never as "high risk".
+            risks_not_evaluated.append({"id": rule.id, "reason": _cause(snapshot, absent),
+                                        "statement": "Risk check not evaluated: " + _describe(snapshot, absent) + ".",
+                                        "references": [_ref(snapshot, m) for m in rule.metrics]})
+            continue
         statement = rule.check(values)
         if statement is not None:
             risks.append({"id": rule.id, "statement": statement,
@@ -71,6 +94,7 @@ def evaluate(strategy: Strategy, snapshot: AgentSnapshot) -> dict:
         "lens": strategy.lens, "stanceMeaning": strategy.stance_meaning,
         "status": status, "stance": stance, "score": score, "coverage": coverage,
         "evidence": evidence, "notEvaluated": not_evaluated, "risks": risks,
+        "risksNotEvaluated": risks_not_evaluated,
         "missingData": sorted(missing), "limitations": list(strategy.limitations),
     }
 
@@ -95,6 +119,7 @@ def validate_references(document: dict) -> None:
                   for item in evaluation["evidence"][direction]]
         groups += [(item, True) for item in evaluation["risks"]]
         groups += [(item, False) for item in evaluation["notEvaluated"]]
+        groups += [(item, False) for item in evaluation["risksNotEvaluated"]]
         for item, must_have_value in groups:
             for ref in item["references"]:
                 if not ref["path"].startswith(METRICS_PATH):

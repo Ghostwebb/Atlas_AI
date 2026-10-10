@@ -292,7 +292,10 @@ These are rules, not an LLM. They run on the synthetic demo dataset, and ARGO is
 P/E lens because the dataset has no book value, cash flow or debt. The agents do **not** form a
 committee yet, choose a winner, recommend allocations or create orders; that comparison is
 planned for Phase 8, and no agent will execute orders automatically. `/api/analyze` and
-`/api/report` are unchanged. Rules, thresholds, contract and examples are in
+`/api/report` are unchanged. Invalid price or volume observations (zero, negative, NaN or
+infinite) are never used: a metric whose window contains one is `null` with an explicit cause.
+Risk checks that could not run are listed apart (`risksNotEvaluated`); `coverage` only measures the
+scored criteria. Rules, thresholds, contract (`agents.v1.1`) and examples are in
 [docs/phase-7-investment-agents.md](docs/phase-7-investment-agents.md).
 
 ## Later phases

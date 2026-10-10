@@ -6,7 +6,8 @@ Units: returns, growth, margins, volatility and drawdowns are DECIMAL fractions 
 P/E is a multiple. Moving averages are in USD.
 """
 
-SCHEMA_VERSION = "agents.v1"
+# v1.1 (additive): metric status/issue, wider notEvaluated reasons, risksNotEvaluated.
+SCHEMA_VERSION = "agents.v1.1"
 
 # --- Price windows (trading days, i.e. bars) ---------------------------------------------
 RETURN_SHORT_WINDOW = 20      # return_20d = close[t] / close[t-20] - 1   (needs 21 bars)
@@ -30,7 +31,8 @@ METRIC_DECIMALS = 6
 STANCE_BAND = 0.25
 
 # --- ARGO (value) v1 -----------------------------------------------------------------------
-ARGO_VERSION = "1.0.0"
+# 1.0.1: same rules; invalid inputs now make criteria not evaluable (snapshot input policy).
+ARGO_VERSION = "1.0.1"
 ARGO_PE_FAVORABLE_MAX = 15.0      # P/E <= 15: low price relative to earnings (heuristic)
 ARGO_PE_UNFAVORABLE_MIN = 25.0    # P/E >= 25: expensive relative to earnings
 ARGO_MARGIN_FAVORABLE_MIN = 0.15  # profit margin >= 15%: earnings quality
@@ -38,7 +40,7 @@ ARGO_MARGIN_UNFAVORABLE_MAX = 0.05  # profit margin < 5% (negative included)
 ARGO_WEIGHTS = {"pe_valuation": 0.5, "margin_quality": 0.3, "value_trap": 0.2}
 
 # --- NOVA (growth) v1 ----------------------------------------------------------------------
-NOVA_VERSION = "1.0.0"
+NOVA_VERSION = "1.0.1"
 NOVA_REVENUE_FAVORABLE_MIN = 0.15
 NOVA_REVENUE_UNFAVORABLE_MAX = 0.05     # < 5% (negative included)
 NOVA_EARNINGS_FAVORABLE_MIN = 0.15
@@ -48,7 +50,7 @@ NOVA_MARGIN_UNFAVORABLE_MAX = 0.05
 NOVA_WEIGHTS = {"revenue_growth": 0.4, "earnings_growth": 0.3, "margin_sustainability": 0.3}
 
 # --- VECTOR (momentum) v1 ------------------------------------------------------------------
-VECTOR_VERSION = "1.0.0"
+VECTOR_VERSION = "1.0.1"
 VECTOR_RETURN_LONG_THRESHOLD = 0.10     # |return_60d| >= 10%
 VECTOR_RETURN_SHORT_THRESHOLD = 0.03    # |return_20d| >= 3%
 VECTOR_VOLUME_CONFIRMATION_MIN = 1.2    # 20d avg volume >= 1.2 x 60d avg volume
@@ -56,7 +58,7 @@ VECTOR_RISK_VOLATILITY_20D = 0.40       # recent annualized volatility flagged a
 VECTOR_WEIGHTS = {"return_60d": 0.35, "trend_alignment": 0.25, "return_20d": 0.25, "volume_confirmation": 0.15}
 
 # --- AEGIS (capital preservation) v1 -------------------------------------------------------
-AEGIS_VERSION = "1.0.0"
+AEGIS_VERSION = "1.0.1"
 AEGIS_VOLATILITY_FAVORABLE_MAX = 0.25
 AEGIS_VOLATILITY_UNFAVORABLE_MIN = 0.45
 AEGIS_MAX_DRAWDOWN_FAVORABLE_MAX = 0.15

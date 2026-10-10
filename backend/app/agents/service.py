@@ -17,6 +17,7 @@ GLOBAL_LIMITATIONS = [
     "Each agent evaluates the same snapshot independently; there is no committee decision in this phase.",
     "Stances describe the evidence through each strategy's lens; agents can legitimately disagree.",
     "Thresholds are documented heuristics, not calibrated against real outcomes.",
+    "coverage measures only the scored criteria; risk checks that could not run are listed in risksNotEvaluated.",
 ]
 
 
@@ -26,8 +27,8 @@ def _snapshot_json(s: AgentSnapshot) -> dict:
         "provenance": s.provenance, "isSimulated": s.is_simulated, "observations": s.observations,
         "firstDate": s.first_date, "lastDate": s.last_date, "dataIssues": list(s.data_issues),
         "warnings": list(s.warnings),
-        "metrics": {key: {"value": m.value, "unit": m.unit, "source": m.source, "window": m.window,
-                          "description": m.description} for key, m in s.metrics.items()},
+        "metrics": {key: {"value": m.value, "status": m.status, "issue": m.issue, "unit": m.unit, "source": m.source,
+                          "window": m.window, "description": m.description} for key, m in s.metrics.items()},
     }
 
 

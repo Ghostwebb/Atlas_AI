@@ -21,9 +21,12 @@ BASE = {
 
 def agent_snapshot(**overrides) -> AgentSnapshot:
     values = {**BASE, **overrides}
+    statuses = values.pop("_status", {})
     metrics = {
         key: Metric(value, UNITS.get(key, "decimal"), "fundamentals" if key in FUNDAMENTAL_KEYS else "price_bars",
-                    None if key in FUNDAMENTAL_KEYS else "test", f"test metric {key}")
+                    None if key in FUNDAMENTAL_KEYS else "test", f"test metric {key}",
+                    statuses.get(key, "missing" if value is None else "ok"),
+                    None if value is not None else f"test {statuses.get(key, 'missing')}")
         for key, value in values.items()
     }
     return AgentSnapshot(symbol="TEST", company_name="Test Co", data_source="demo_dataset", provenance="synthetic",
