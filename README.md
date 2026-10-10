@@ -172,9 +172,9 @@ npm run dev          # development, http://localhost:3000
 Open http://localhost:3000 and try `NVDA`, `TSLA`, `AAPL`, `MSFT`, `AMZN`, `GOOGL` or `META`.
 Invalid format returns 400. Unknown symbols return 404. Both show a clear error.
 
-Configuration (optional): `backend/.env.example` → `ATLAS_CORS_ORIGINS` and the Phase 4
-narration settings; `frontend/.env.example` → `NEXT_PUBLIC_API_URL`. No credentials are
-required. The backend does not load `.env` by itself: export the variables (or
+Configuration (optional): `backend/.env.example` → `ATLAS_CORS_ORIGINS`, the Phase 4
+narration settings and the Phase 5 paper trading settings; `frontend/.env.example` →
+`NEXT_PUBLIC_API_URL`. No credentials are required unless you enable paper trading. The backend does not load `.env` by itself: export the variables (or
 `set -a; source .env; set +a`) in the shell that starts uvicorn.
 
 ## Tests
@@ -192,7 +192,10 @@ exact thresholds, status precedence, data quality and provenance, report wording
 HTTP supervision contract for all seven demo symbols. Phase 4 adds narration tests with a
 mocked HTTP transport (no LM Studio needed): configuration, evidence packet, output validation,
 fallback in both languages, connection/timeout/HTTP/malformed/busy cases and the
-`/api/report` contract.
+`/api/report` contract. Phase 5 adds paper trading tests with a fake broker and a mocked
+HTTP transport (no test calls Alpaca): configuration guards, validation rules, idempotent and
+concurrent confirmation, uncertain submissions, reconciliation, restart recovery, fills,
+cancellation and the `/api/paper` contract.
 
 Frontend checks:
 
@@ -209,6 +212,7 @@ npm run build
 - `POST /api/analyze` with `{ "symbol": "NVDA" }` → analysis (see example above).
 - `POST /api/report` with `{ "symbol": "NVDA", "language": "es" }` → `{ analysis, narrative }`
   (see Phase 4 below).
+- `/api/paper/*`: Alpaca Paper Trading lab (see Phase 5 below).
 
 Errors (`400` malformed input, `404` unknown symbol) share one shape:
 
@@ -272,7 +276,25 @@ Setup, the full contract, validation limits, frontend guidance and the manual LM
 are in [docs/phase-4-narration.md](docs/phase-4-narration.md). The check against a real
 model has not been run yet.
 
+## Paper Trading Lab (Phase 5)
+
+Optional and off by default (`ATLAS_PAPER_TRADING_ENABLED=false`). With paper credentials, the
+backend prepares, validates, confirms and tracks **simulated** market orders in an
+**Alpaca Paper** account. The endpoint is fixed to `https://paper-api.alpaca.markets`; any live
+configuration stops the server. Buys are by USD notional, sells by quantity of an existing
+long position, during the regular session, with no shorts, leverage, options or crypto.
+
+Preparing a proposal never submits. Confirmation requires
+`{"confirmation": "CONFIRM_PAPER_ORDER"}` and submits at most once per proposal. A database
+transaction plus a unique `client_order_id` enforce this. An uncertain result
+(`submission_unknown`) is reconciled by `client_order_id` and never resent. Analysis and
+narrative never create or confirm orders, and the synthetic analysis is never used for prices.
+
+The backend has no authentication: run it locally only. Contract, states, errors, frontend
+guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).
+The check against a real Alpaca Paper account has not been run yet.
+
 ## Later phases
 
-- Dashboard charts and the supervision and narrative panels (frontend).
-- Phase 5: validation and offline run.
+- Frontend: dashboard charts, supervision, narrative and paper trading panels.
+- Validation and offline run.
