@@ -1,0 +1,674 @@
+"""Paper trading service: proposals, reservations, confirmation, submission, reconciliation.
+
+Flow:
+  prepare  read broker snapshot -> static checks -> capacity (no reservation) -> persist
+  confirm  read broker snapshot -> static checks -> refresh known commitments
+           -> ONE SQLite transaction: proposal open->confirmed/submitting, capacity
+              re-check against all active reservations, reservation 'held', intent event
+           -> submit once (no transaction open during HTTP)
+           -> persist outcome (and reservation state) atomically
+Uncertain outcomes keep their reservation and are reconciled, never resent.
+Every broker observation of an ATLAS order goes through `_observe_order`, so
+reads, reconciliation, recovery and cancellation apply the same policy to the
+proposal and its reservation together.
+"""
+
+import logging
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Callable
+
+from app.paper.client import (
+    BrokerClient,
+    BrokerConflict,
+    BrokerNotFound,
+    BrokerUnavailable,
+    SubmitOutcome,
+    SubmitResult,
+)
+from app.paper.config import (
+    DEFAULT_ORDERS_PAGE,
+    ENVIRONMENT,
+    MAX_ORDERS_PAGE,
+    ORDER_TYPE,
+    TIME_IN_FORCE,
+    PaperSettings,
+)
+from app.paper.models import (
+    TERMINAL_BROKER_STATUSES,
+    Account,
+    BrokerOrder,
+    BrokerOrderStatus,
+    Check,
+    Clock,
+    ErrorCode,
+    PaperError,
+    PaperStatus,
+    Position,
+    Proposal,
+    ProposalRequest,
+    Reservation,
+    Side,
+)
+from app.paper.reconciliation import order_changes, order_matches, to_broker_order
+from app.paper.repository import Repository, consumed_amount, effect, measures_for
+from app.paper.reservations import (
+    OPEN_ORDERS_PAGE,
+    Expected,
+    broker_cash,
+    broker_shares,
+    decide,
+    require_complete,
+)
+from app.paper.validation import dec, run_checks
+
+logger = logging.getLogger("atlas.paper")
+
+ANALYSIS_NOTICE = (
+    "ATLAS analysis uses a synthetic demo dataset. It is not market data and is not "
+    "linked to paper orders, balances or prices."
+)
+WARNINGS = [
+    "Paper trading: simulated money in an Alpaca Paper account.",
+    "Market order: the execution price is not known in advance and is not guaranteed.",
+    "Preparing does not reserve funds or shares; confirmation re-checks them and Alpaca may still reject the order.",
+    ANALYSIS_NOTICE,
+]
+_ORDER_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+_UNCERTAIN = ("submitting", "submission_unknown")
+# A submission is owned by the process that claimed it until this lease ends.
+# The HTTP timeout is 10 s, so an unexpired lease means the owner may still be sending.
+SUBMIT_LEASE_SECONDS = 120
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+
+class PaperTradingService:
+    def __init__(self, settings: PaperSettings, client: BrokerClient | None,
+                 repository: Repository | None, now: Callable[[], datetime] | None = None):
+        self.settings = settings
+        self.client = client
+        self.repository = repository
+        self._now = now or (lambda: datetime.now(timezone.utc))
+        self.instance_id = uuid.uuid4().hex  # lease owner id for this process
+
+    # --- guards -----------------------------------------------------------
+
+    def _ready(self) -> tuple[BrokerClient, Repository]:
+        if not self.settings.enabled:
+            raise PaperError(ErrorCode.PAPER_DISABLED, "Paper trading is disabled on this server.")
+        if not self.settings.configured or self.client is None or self.repository is None:
+            raise PaperError(ErrorCode.PAPER_NOT_CONFIGURED,
+                             "Alpaca Paper credentials are not configured on this server.")
+        return self.client, self.repository
+
+    def _read(self, fn: Callable[[], Any]) -> Any:
+        try:
+            return fn()
+        except BrokerUnavailable as error:
+            raise PaperError(ErrorCode.BROKER_UNAVAILABLE, "Alpaca Paper is not reachable right now.") from error
+
+    def _event(self, proposal_id: str | None, kind: str, correlation_id: str | None, **data) -> dict:
+        logger.info("paper_event type=%s proposal=%s correlation=%s", kind, proposal_id, correlation_id)
+        return {"proposal_id": proposal_id, "at": _iso(self._now()), "type": kind,
+                "correlation_id": correlation_id, "data": data}
+
+    # --- read-only endpoints ---------------------------------------------
+
+    def status(self) -> PaperStatus:
+        base = dict(enabled=self.settings.enabled, configured=self.settings.configured,
+                    maxOrderNotionalUsd=self.settings.max_order_notional,
+                    proposalTtlSeconds=self.settings.proposal_ttl_seconds,
+                    analysisDataNotice=ANALYSIS_NOTICE)
+        if not self.settings.enabled:
+            return PaperStatus(**base, brokerReachable=None, marketOpen=None,
+                               message="Paper trading is disabled.")
+        if not self.settings.configured or self.client is None:
+            return PaperStatus(**base, brokerReachable=None, marketOpen=None,
+                               message="Alpaca Paper credentials are missing.")
+        try:
+            clock = self.client.get_clock()
+        except BrokerUnavailable:
+            return PaperStatus(**base, brokerReachable=False, marketOpen=None,
+                               message="Alpaca Paper is not reachable.")
+        return PaperStatus(**base, brokerReachable=True, marketOpen=clock.get("is_open") is True,
+                           message="Connected to Alpaca Paper.")
+
+    def account(self) -> Account:
+        client, _ = self._ready()
+        raw = self._read(client.get_account)
+        return Account(
+            status=str(raw.get("status")), currency=str(raw.get("currency") or "USD"),
+            cash=dec(raw.get("cash")), buyingPower=dec(raw.get("buying_power")),
+            nonMarginableBuyingPower=dec(raw.get("non_marginable_buying_power")),
+            equity=dec(raw.get("equity")), tradingBlocked=bool(raw.get("trading_blocked")),
+            accountBlocked=bool(raw.get("account_blocked")),
+        )
+
+    def positions(self) -> list[Position]:
+        client, _ = self._ready()
+        rows = self._read(client.list_positions)
+        return [
+            Position(symbol=str(p.get("symbol")), side=str(p.get("side")), qty=dec(p.get("qty")) or Decimal(0),
+                     qtyAvailable=dec(p.get("qty_available")), avgEntryPrice=dec(p.get("avg_entry_price")),
+                     marketValue=dec(p.get("market_value")), assetClass=p.get("asset_class"))
+            for p in rows
+        ]
+
+    def clock(self) -> Clock:
+        client, _ = self._ready()
+        raw = self._read(client.get_clock)
+        return Clock(isOpen=raw.get("is_open") is True, timestamp=raw.get("timestamp"),
+                     nextOpen=raw.get("next_open"), nextClose=raw.get("next_close"))
+
+    # --- central observation of ATLAS orders ------------------------------------
+
+    def _observe_order(self, row: dict, order: dict, correlation_id: str | None, kind: str,
+                       expected: tuple[str, ...] = ("submitting", "submission_unknown", "submitted")) -> bool:
+        """Apply a broker order to its proposal AND reservation in one transaction.
+
+        acknowledged while the order is not final; released (reason order_terminal)
+        only when Alpaca reports filled, canceled, expired or rejected. Consumption is
+        recorded from the broker's filled_qty / filled_avg_price.
+        """
+        if not order_matches(row, order):
+            logger.warning("paper order mismatch proposal=%s", row["id"])
+            return False
+        now = _iso(self._now())
+        status = BrokerOrderStatus.parse(order.get("status"))
+        terminal = status in TERMINAL_BROKER_STATUSES
+        filled_qty = dec(order.get("filled_qty")) or Decimal(0)
+        consumed = consumed_amount(row["side"], order.get("filled_qty"), order.get("filled_avg_price"))
+        filled_notional = consumed_amount("buy", order.get("filled_qty"), order.get("filled_avg_price"))
+        reservation = {
+            "state": "released" if terminal else "acknowledged",
+            "release_reason": "order_terminal" if terminal else None,
+            "broker_order_id": order["id"],
+            "consumed": str(consumed),
+            "filled_qty": str(filled_qty),
+            "filled_notional": str(filled_notional),
+            "updated_at": now,
+        }
+
+        def not_older(current: dict) -> bool:
+            # A response never moves fills backwards or reopens a final order.
+            stored_qty = dec(current.get("filled_qty")) or Decimal(0)
+            stored_final = BrokerOrderStatus.parse(current.get("broker_status")) in TERMINAL_BROKER_STATUSES
+            return filled_qty >= stored_qty and (terminal or not stored_final)
+
+        applied = self.repository.transition(
+            row["id"], {"submission_status": expected}, order_changes(order, now),
+            self._event(row["id"], kind, correlation_id, broker_order_id=order["id"],
+                        broker_status=order.get("status"), filled_qty=order.get("filled_qty"),
+                        reservation_state=reservation["state"]),
+            reservation_changes=reservation, guard=not_older,
+        )
+        if not applied:
+            self.repository.add_event(self._event(row["id"], "stale_order_ignored", correlation_id,
+                                                  broker_status=order.get("status"),
+                                                  filled_qty=order.get("filled_qty")))
+        return applied
+
+    # --- snapshot and capacity ----------------------------------------------------
+
+    def _snapshot(self, side: Side, symbol: str) -> dict:
+        client, _ = self._ready()
+        snap = {
+            "account": self._read(client.get_account),
+            "clock": self._read(client.get_clock),
+            "asset": self._read(lambda: client.get_asset(symbol)),
+            # Position is read for buys too: buys change the share ledger of the symbol.
+            "position": self._read(lambda: client.get_position(symbol)),
+            "open_orders": self._read(lambda: client.list_orders("open", OPEN_ORDERS_PAGE)),
+        }
+        require_complete(snap["open_orders"])
+        return snap
+
+    def _resource(self, side: Side, symbol: str) -> tuple[str, str | None]:
+        return ("cash", None) if side is Side.BUY else ("shares", symbol)
+
+    def _refresh_commitments(self, side: Side, symbol: str, open_orders: list[dict],
+                             correlation_id: str | None) -> None:
+        """Use the fresh open-order list (and per-order reads) to update known
+        commitments before deciding. Never releases anything without a broker
+        observation of a final status."""
+        client, repo = self._ready()
+        by_client_id = {o.get("client_order_id"): o for o in open_orders}
+        # Every active ATLAS order is refreshed, not only those of this resource: a buy
+        # also changes the share ledger and a sell also changes the cash ledger.
+        for row in repo.all_active_reservations():
+            proposal = repo.get_proposal(row["proposal_id"])
+            if proposal["submission_status"] == "submitting":
+                continue  # its owner will record the outcome
+            order = by_client_id.get(row["client_order_id"])
+            if order is None and row["state"] == "acknowledged" and row["broker_order_id"]:
+                order = self._read(lambda: client.get_order(row["broker_order_id"]))
+            if order is not None:
+                self._observe_order(proposal, order, correlation_id, "order_observed",
+                                    expected=("submission_unknown", "submitted"))
+
+    @staticmethod
+    def _snapshot_value(snap: dict, measure: str) -> Decimal:
+        if measure == "cash":
+            value = dec(snap["account"].get("cash"))
+            if value is None:
+                raise PaperError(ErrorCode.BROKER_UNAVAILABLE, "The broker did not report cash.")
+            return value
+        position = snap["position"]
+        return (dec(position.get("qty")) or Decimal(0)) if position else Decimal(0)
+
+    @staticmethod
+    def _snapshot_may_govern(rows: list[dict]) -> bool:
+        """Phase 5.7 invariant. A snapshot can only be trusted for a measure if ATLAS has
+        never observed a fill on it and nothing is in flight on it. The check uses the
+        fill HISTORY (cumulative filled_qty / filled_notional, monotonic and persisted),
+        never the net effect: fills that cancel out (buy then sell) still happened, and
+        a snapshot taken between them would carry an intermediate, higher value."""
+        ever_filled = any(Decimal(r["filled_qty"]) != 0 or Decimal(r["filled_notional"]) != 0 for r in rows)
+        active = any(r["state"] in ("held", "acknowledged") for r in rows)
+        return not ever_filled and not active
+
+    def _expected(self, measure: str, conn=None) -> Expected:
+        repo = self.repository
+        rows = [r for r in repo.ledger_rows(conn) if measure in measures_for(r["symbol"])]
+        checkpoint = repo.checkpoint(measure, conn)
+        if checkpoint is None:
+            # No checkpoint is created before the first ATLAS claim on the measure.
+            return Expected(None, unverifiable=bool(rows))
+        if checkpoint["value"] is None:
+            return Expected(None, unverifiable=True)
+        if self._snapshot_may_govern(rows):
+            # Same rule the claim transaction uses to move the checkpoint to the snapshot.
+            return Expected(None)
+        total = sum((effect(r, measure) for r in rows), Decimal(0))
+        return Expected(Decimal(checkpoint["value"]) + total - Decimal(checkpoint["base_effect"]))
+
+    def _prepare_checkpoints(self, conn, symbol: str, snap: dict) -> None:
+        """Inside the claim transaction: create a checkpoint the first time a measure is
+        used, or move it to the snapshot only while `_snapshot_may_govern` holds (ATLAS
+        has never observed a fill on the measure and nothing is active on it). After the
+        first ATLAS fill on a measure its checkpoint never moves again."""
+        repo, now = self.repository, _iso(self._now())
+        ledger = repo.ledger_rows(conn)
+        for measure in measures_for(symbol):
+            rows = [r for r in ledger if measure in measures_for(r["symbol"])]
+            total = sum((effect(r, measure) for r in rows), Decimal(0))
+            checkpoint = repo.checkpoint(measure, conn)
+            if checkpoint is None:
+                if rows:
+                    conn.execute("INSERT INTO ledger_checkpoints (measure, value, base_effect, created_at, "
+                                 "updated_at) VALUES (?, NULL, ?, ?, ?)", (measure, str(total), now, now))
+                else:
+                    repo.put_checkpoint(conn, measure, self._snapshot_value(snap, measure), total, now)
+            elif checkpoint["value"] is not None and self._snapshot_may_govern(rows):
+                repo.put_checkpoint(conn, measure, self._snapshot_value(snap, measure), total, now)
+
+    def _capacity_check(self, side: Side, symbol: str, amount: Decimal, snap: dict,
+                        rows: list[dict], conn=None) -> Check:
+        if side is Side.BUY:
+            capacity = broker_cash(snap["account"], snap["open_orders"], self._expected("cash", conn))
+        else:
+            capacity = broker_shares(snap["position"], snap["open_orders"], symbol,
+                                     self._expected(f"qty:{symbol}", conn))
+        open_ids = {o.get("client_order_id") for o in snap["open_orders"]}
+        now = _iso(self._now())
+        uncertain = {r["proposal_id"] for r in rows
+                     if r["submission_status"] == "submission_unknown"
+                     or (r["submission_status"] == "submitting" and (r["submit_lease_until"] or "") <= now)}
+        return decide(side, amount, capacity, rows, open_ids, uncertain)
+
+    def _validate(self, side: Side, symbol: str, notional: Decimal | None, qty: Decimal | None,
+                  correlation_id: str | None) -> tuple[list[Check], dict]:
+        _, repo = self._ready()
+        snap = self._snapshot(side, symbol)
+        checks = run_checks(self.settings, side, symbol, notional, qty,
+                            snap["account"], snap["clock"], snap["asset"])
+        self._refresh_commitments(side, symbol, snap["open_orders"], correlation_id)
+        amount = notional if side is Side.BUY else qty
+        rows = repo.active_reservations(*self._resource(side, symbol))
+        checks.append(self._capacity_check(side, symbol, amount, snap, rows))
+        return checks, snap
+
+    # --- proposals -----------------------------------------------------------
+
+    def create_proposal(self, request: ProposalRequest, correlation_id: str) -> Proposal:
+        _, repo = self._ready()
+        notional = Decimal(request.notional) if request.notional else None
+        qty = Decimal(request.qty) if request.qty else None
+        try:
+            checks, _ = self._validate(request.side, request.symbol, notional, qty, correlation_id)
+        except PaperError as error:
+            repo.add_event(self._event(None, "validation_failed", correlation_id, stage="prepare",
+                                       symbol=request.symbol, side=request.side.value, code=error.code.value))
+            raise
+
+        now = self._now()
+        proposal_id = uuid.uuid4().hex
+        row = {
+            "id": proposal_id,
+            "client_order_id": f"atlas-{proposal_id}",
+            "environment": ENVIRONMENT,
+            "symbol": request.symbol,
+            "side": request.side.value,
+            "notional": str(notional) if notional is not None else None,
+            "qty": str(qty) if qty is not None else None,
+            "order_type": ORDER_TYPE,
+            "time_in_force": TIME_IN_FORCE,
+            "analysis_reference": request.analysisReference,
+            "created_at": _iso(now),
+            "expires_at": _iso(now + timedelta(seconds=self.settings.proposal_ttl_seconds)),
+            "status": "open",
+            "submission_status": "not_submitted",
+            "broker_order_id": None, "broker_status": None, "filled_qty": None,
+            "filled_avg_price": None, "last_error_code": None,
+            "checks": [c.model_dump() for c in checks],
+            "warnings": WARNINGS,
+            "updated_at": _iso(now),
+            "version": 0,
+        }
+        repo.insert_proposal(row, self._event(
+            proposal_id, "proposal_created", correlation_id, symbol=row["symbol"], side=row["side"],
+            notional=row["notional"], qty=row["qty"], client_order_id=row["client_order_id"]))
+        return self._to_proposal(repo.get_proposal(proposal_id))
+
+    def get_proposal(self, proposal_id: str) -> Proposal:
+        _, repo = self._ready()
+        row = self._load(repo, proposal_id)
+        row = self._expire_if_due(repo, row, None)
+        return self._to_proposal(row)
+
+    def _load(self, repo: Repository, proposal_id: str) -> dict:
+        row = repo.get_proposal(proposal_id) if re.fullmatch(r"[0-9a-f]{32}", proposal_id) else None
+        if row is None:
+            raise PaperError(ErrorCode.PROPOSAL_NOT_FOUND, "The proposal does not exist.")
+        return row
+
+    def _expire_if_due(self, repo: Repository, row: dict, correlation_id: str | None) -> dict:
+        # Only proposals that were never sent can expire; a submission in flight or
+        # uncertain is never released by expiry.
+        now = _iso(self._now())
+        if row["status"] == "open" and row["submission_status"] in ("not_submitted", "failed_before_submit") \
+                and now >= row["expires_at"]:
+            repo.transition(row["id"], {"status": ("open",)},
+                            {"status": "expired", "updated_at": now},
+                            self._event(row["id"], "proposal_expired", correlation_id))
+            row = repo.get_proposal(row["id"])
+        return row
+
+    def _known_result(self, row: dict) -> Proposal:
+        """Outcome of a proposal that was already confirmed (idempotent confirm)."""
+        submission = row["submission_status"]
+        if submission == "submitted":
+            return self._to_proposal(row)
+        if submission == "submitting":
+            raise PaperError(ErrorCode.SUBMISSION_IN_PROGRESS,
+                             "This proposal is being submitted. Check its status.", row["id"])
+        if submission == "submission_unknown":
+            raise PaperError(ErrorCode.SUBMISSION_UNCERTAIN,
+                             "The submission result is uncertain. Reconcile the proposal; it will not be resent.",
+                             row["id"])
+        if submission == "rejected_by_broker":
+            raise PaperError(ErrorCode.BROKER_REJECTED, "Alpaca Paper rejected this order.", row["id"])
+        raise AssertionError(f"unexpected confirmed state {submission}")
+
+    def confirm(self, proposal_id: str, correlation_id: str) -> Proposal:
+        client, repo = self._ready()
+        row = self._load(repo, proposal_id)
+        row = self._expire_if_due(repo, row, correlation_id)
+        if row["status"] == "expired":
+            raise PaperError(ErrorCode.PROPOSAL_EXPIRED, "The proposal has expired.", proposal_id)
+        if row["status"] == "confirmed":
+            return self._known_result(row)
+
+        side = Side(row["side"])
+        notional, qty = dec(row["notional"]), dec(row["qty"])
+        amount = notional if side is Side.BUY else qty
+        try:
+            checks, snap = self._validate(side, row["symbol"], notional, qty, correlation_id)
+        except PaperError as error:
+            repo.add_event(self._event(proposal_id, "validation_failed", correlation_id,
+                                       stage="confirm", code=error.code.value))
+            error.proposal_id = proposal_id
+            raise
+
+        now_dt = self._now()
+        now = _iso(now_dt)
+        resource_type, symbol = self._resource(side, row["symbol"])
+
+        def recheck(conn) -> None:
+            # Inside the write transaction: other proposals' reservations and fills
+            # committed after our snapshot are visible here and are accounted for.
+            self._prepare_checkpoints(conn, row["symbol"], snap)
+            rows = repo.active_reservations(resource_type, symbol, conn)
+            self._capacity_check(side, row["symbol"], amount, snap, rows, conn)
+
+        try:
+            claimed = repo.claim(
+                proposal_id,
+                {"status": ("open",), "submission_status": ("not_submitted", "failed_before_submit")},
+                {"status": "confirmed", "submission_status": "submitting", "last_error_code": None,
+                 "submit_owner": self.instance_id,
+                 "submit_lease_until": _iso(now_dt + timedelta(seconds=SUBMIT_LEASE_SECONDS)),
+                 "updated_at": now},
+                {"resource_type": resource_type, "symbol": symbol, "amount": str(amount), "created_at": now},
+                self._event(proposal_id, "submission_intent", correlation_id,
+                            client_order_id=row["client_order_id"], symbol=row["symbol"], side=row["side"],
+                            notional=row["notional"], qty=row["qty"], reservation=str(amount),
+                            resource=resource_type, checks=[c.name for c in checks if c.passed]),
+                recheck,
+                extra_where="expires_at > ?", extra_params=(now,),
+            )
+        except PaperError as error:
+            repo.add_event(self._event(proposal_id, "validation_failed", correlation_id,
+                                       stage="claim", code=error.code.value))
+            error.proposal_id = proposal_id
+            raise
+        if not claimed:
+            # Another confirmation won the race, or the proposal just expired.
+            row = self._expire_if_due(repo, repo.get_proposal(proposal_id), correlation_id)
+            if row["status"] == "expired":
+                raise PaperError(ErrorCode.PROPOSAL_EXPIRED, "The proposal has expired.", proposal_id)
+            return self._known_result(row)
+
+        payload = {"symbol": row["symbol"], "side": row["side"], "type": ORDER_TYPE,
+                   "time_in_force": TIME_IN_FORCE, "client_order_id": row["client_order_id"]}
+        if side is Side.BUY:
+            payload["notional"] = row["notional"]
+        else:
+            payload["qty"] = row["qty"]
+
+        try:
+            result = client.submit_order(payload)
+        except Exception:  # noqa: BLE001 - anything after the claim leaves the outcome uncertain
+            logger.exception("paper submit raised proposal=%s correlation=%s", proposal_id, correlation_id)
+            result = SubmitResult(SubmitOutcome.UNKNOWN, detail="client exception")
+        return self._apply_submit_result(repo, repo.get_proposal(proposal_id), result, correlation_id)
+
+    def _apply_submit_result(self, repo: Repository, row: dict, result: SubmitResult,
+                             correlation_id: str) -> Proposal:
+        pid, now = row["id"], _iso(self._now())
+        submitting = {"submission_status": ("submitting",)}
+        if result.outcome is SubmitOutcome.ACCEPTED and order_matches(row, result.order):
+            self._observe_order(row, result.order, correlation_id, "broker_accepted", expected=("submitting",))
+            return self._to_proposal(repo.get_proposal(pid))
+        if result.outcome is SubmitOutcome.REJECTED:
+            repo.transition(pid, submitting,
+                            {"submission_status": "rejected_by_broker",
+                             "last_error_code": ErrorCode.BROKER_REJECTED.value, "updated_at": now},
+                            self._event(pid, "broker_rejected", correlation_id, http_status=result.http_status),
+                            reservation_changes={"state": "released", "release_reason": "broker_rejected",
+                                                 "updated_at": now})
+            raise PaperError(ErrorCode.BROKER_REJECTED, "Alpaca Paper rejected this order.", pid)
+        if result.outcome is SubmitOutcome.NOT_SENT:
+            # The connection was never established: nothing reached Alpaca.
+            repo.transition(pid, submitting,
+                            {"status": "open", "submission_status": "failed_before_submit",
+                             "last_error_code": ErrorCode.BROKER_UNAVAILABLE.value, "updated_at": now},
+                            self._event(pid, "submission_not_sent", correlation_id, detail=result.detail),
+                            reservation_changes={"state": "released", "release_reason": "not_sent",
+                                                 "updated_at": now})
+            raise PaperError(ErrorCode.BROKER_UNAVAILABLE,
+                             "Alpaca Paper was not reachable; the order was not sent.", pid)
+
+        # UNKNOWN (or an accepted body that does not match): the reservation stays held.
+        repo.transition(pid, submitting,
+                        {"submission_status": "submission_unknown",
+                         "last_error_code": ErrorCode.SUBMISSION_UNCERTAIN.value, "updated_at": now},
+                        self._event(pid, "submission_unknown", correlation_id,
+                                    detail=result.detail, http_status=result.http_status))
+        # One read-only lookup by client_order_id. Never a resubmission.
+        try:
+            return self.reconcile(pid, correlation_id)
+        except PaperError:
+            raise PaperError(ErrorCode.SUBMISSION_UNCERTAIN,
+                             "The submission result is uncertain. Reconcile the proposal; it will not be resent.",
+                             pid) from None
+
+    # --- reconciliation ----------------------------------------------------
+
+    def _lease_expired(self, row: dict) -> bool:
+        return (row.get("submit_lease_until") or "") <= _iso(self._now())
+
+    def _mark_interrupted(self, repo: Repository, row: dict, correlation_id: str | None, kind: str) -> None:
+        repo.transition(row["id"], {"submission_status": ("submitting",)},
+                        {"submission_status": "submission_unknown",
+                         "last_error_code": ErrorCode.SUBMISSION_UNCERTAIN.value,
+                         "updated_at": _iso(self._now())},
+                        self._event(row["id"], kind, correlation_id),
+                        extra_where="(submit_lease_until IS NULL OR submit_lease_until <= ?)",
+                        extra_params=(_iso(self._now()),))
+
+    def reconcile(self, proposal_id: str, correlation_id: str | None) -> Proposal:
+        client, repo = self._ready()
+        row = self._load(repo, proposal_id)
+        if row["submission_status"] not in ("submitting", "submission_unknown", "submitted"):
+            return self._to_proposal(self._expire_if_due(repo, row, correlation_id))
+        if row["submission_status"] == "submitting":
+            if not self._lease_expired(row):
+                raise PaperError(ErrorCode.SUBMISSION_IN_PROGRESS,
+                                 "This proposal is being submitted. Check its status.", proposal_id)
+            self._mark_interrupted(repo, row, correlation_id, "submission_lease_expired")
+            row = repo.get_proposal(proposal_id)
+
+        if row["broker_order_id"]:
+            order = self._read(lambda: client.get_order(row["broker_order_id"]))
+        else:
+            order = self._read(lambda: client.get_order_by_client_id(row["client_order_id"]))
+        if order is None or not order_matches(row, order):
+            repo.add_event(self._event(proposal_id, "reconcile_not_found", correlation_id,
+                                       client_order_id=row["client_order_id"]))
+            if row["submission_status"] == "submission_unknown":
+                # Not finding the order does not prove it was never sent: keep protection.
+                raise PaperError(ErrorCode.SUBMISSION_UNCERTAIN,
+                                 "No matching order was found yet. The proposal stays uncertain and will not be resent.",
+                                 proposal_id)
+            raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The broker order was not found.", proposal_id)
+
+        self._observe_order(row, order, correlation_id, "reconciled",
+                            expected=("submission_unknown", "submitted"))
+        return self._to_proposal(repo.get_proposal(proposal_id))
+
+    def recover_pending(self) -> list[str]:
+        """Startup recovery: submissions whose lease expired become uncertain and are
+        reconciled read-only. Reservations are kept (and never dropped) throughout.
+        Submissions with a live lease belong to another process and are left alone."""
+        if not self.settings.enabled or self.repository is None:
+            return []
+        repo = self.repository
+        recovered = []
+        for row in repo.list_by_submission(_UNCERTAIN):
+            if row["submission_status"] == "submitting":
+                if not self._lease_expired(row):
+                    continue
+                self._mark_interrupted(repo, row, None, "recovered_after_restart")
+            recovered.append(row["id"])
+            if self.client is not None and self.settings.configured:
+                try:
+                    self.reconcile(row["id"], None)
+                except PaperError:
+                    pass  # stays submission_unknown with its reservation; visible to the user
+        return recovered
+
+    # --- orders -------------------------------------------------------------------
+
+    def _proposal_for(self, repo: Repository, order: dict) -> dict | None:
+        row = repo.get_by_client_order_id(str(order.get("client_order_id") or ""))
+        return row if row is not None and order_matches(row, order) else None
+
+    def list_orders(self, status: str = "all", limit: int = DEFAULT_ORDERS_PAGE) -> list[BrokerOrder]:
+        client, repo = self._ready()
+        if status not in ("open", "closed", "all") or not 1 <= limit <= MAX_ORDERS_PAGE:
+            raise PaperError(ErrorCode.INVALID_REQUEST,
+                             f"status must be open, closed or all; limit must be 1-{MAX_ORDERS_PAGE}.")
+        orders = self._read(lambda: client.list_orders(status, limit))
+        result = []
+        for order in orders[:limit]:
+            row = self._proposal_for(repo, order)
+            result.append(to_broker_order(order, row["id"] if row else None))
+        return result
+
+    def get_order(self, order_id: str, correlation_id: str | None = None) -> BrokerOrder:
+        client, repo = self._ready()
+        if not _ORDER_ID.fullmatch(order_id):
+            raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The order does not exist.")
+        order = self._read(lambda: client.get_order(order_id))
+        if order is None:
+            raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The order does not exist.")
+        row = self._proposal_for(repo, order)
+        if row is not None:
+            self._observe_order(row, order, correlation_id, "order_status",
+                                expected=("submitted", "submission_unknown"))
+        return to_broker_order(order, row["id"] if row else None)
+
+    def cancel_order(self, order_id: str, correlation_id: str) -> dict:
+        client, repo = self._ready()
+        if not _ORDER_ID.fullmatch(order_id):
+            raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The order does not exist.")
+        linked = repo.get_by_broker_order_id(order_id)
+        linked_id = linked["id"] if linked else None
+        repo.add_event(self._event(linked_id, "cancel_requested", correlation_id, broker_order_id=order_id))
+        try:
+            client.cancel_order(order_id)
+        except BrokerNotFound:
+            raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The order does not exist.") from None
+        except BrokerConflict:
+            repo.add_event(self._event(linked_id, "cancel_rejected", correlation_id, broker_order_id=order_id))
+            raise PaperError(ErrorCode.ORDER_NOT_CANCELABLE,
+                             "The order can no longer be canceled (it may already be filled or closed).",
+                             linked_id) from None
+        except BrokerUnavailable:
+            raise PaperError(ErrorCode.BROKER_UNAVAILABLE, "Alpaca Paper is not reachable right now.") from None
+        # A 204 means "cancel requested", not "canceled": report Alpaca's current status.
+        # The reservation follows the observed status (pending_cancel keeps it).
+        order = self.get_order(order_id, correlation_id)
+        repo.add_event(self._event(linked_id, "cancel_result", correlation_id, broker_order_id=order_id,
+                                   broker_status=order.status.value))
+        return {"cancelRequested": True, "order": order}
+
+    # --- serialization -------------------------------------------------------------
+
+    def _to_proposal(self, row: dict) -> Proposal:
+        latest = self.repository.latest_reservation(row["id"]) if self.repository else None
+        reservation = None
+        if latest is not None:
+            reservation = Reservation(
+                resourceType=latest["resource_type"], symbol=latest["symbol"],
+                amount=Decimal(latest["amount"]), consumed=Decimal(latest["consumed"]),
+                state=latest["state"], releaseReason=latest["release_reason"],
+                filledQty=Decimal(latest["filled_qty"]), filledNotional=Decimal(latest["filled_notional"]),
+            )
+        return Proposal(
+            id=row["id"], environment=row["environment"], symbol=row["symbol"], side=row["side"],
+            notional=dec(row["notional"]), qty=dec(row["qty"]), orderType=row["order_type"],
+            timeInForce=row["time_in_force"], clientOrderId=row["client_order_id"],
+            analysisReference=row["analysis_reference"], createdAt=row["created_at"],
+            expiresAt=row["expires_at"], status=row["status"], submissionStatus=row["submission_status"],
+            brokerOrderId=row["broker_order_id"], brokerStatus=row["broker_status"],
+            filledQty=dec(row["filled_qty"]), filledAvgPrice=dec(row["filled_avg_price"]),
+            lastErrorCode=row["last_error_code"], checks=row["checks"], warnings=row["warnings"],
+            updatedAt=row["updated_at"], reservation=reservation,
+        )

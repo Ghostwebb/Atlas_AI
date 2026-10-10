@@ -4,6 +4,10 @@ __pycache__/
 .venv/
 .pytest_cache/
 backend/scripts/manual_lmstudio_result*.json
+backend/var/
+backend/scripts/manual_alpaca_paper.sqlite3*
+*.sqlite3-wal
+*.sqlite3-shm
 
 # Env files (keep only the .example files in the repo)
 .env
