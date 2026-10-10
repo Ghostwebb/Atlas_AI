@@ -12,8 +12,9 @@ components are **not** modified.
 | `policy.ts` | Pure eligibility rules and the follow-up endpoint for a proposal |
 | `validate.ts` | Runtime validation of every response used to authorize an action |
 | `controller.ts` | Operation controller: state, locks, polling, reconciliation |
+| `journal.ts` | Versioned operation journal (sessionStorage adapter) for recovery after reload |
 | `usePaperTradingController.ts` | Optional React hook around the controller |
-| `contract.test.mjs`, `controller.test.mjs`, `identity-cancel.test.mjs` | Fixture-only tests (Node test runner) |
+| `contract.test.mjs`, `controller.test.mjs`, `identity-cancel.test.mjs`, `recovery.test.mjs` | Fixture-only tests (Node test runner) |
 | `test-fixtures.mjs` | Shared simulated HTTP fixtures, manual clock and scheduler |
 | `run-tests.sh` | Compiles the folder to a temp dir and runs all test files |
 | `ui/PaperTradingScreen.tsx` | Client screen for `/paper-trading` (route file: `app/paper-trading/page.tsx`) |
@@ -28,6 +29,7 @@ components are **not** modified.
 ```ts
 const ctl = createPaperTradingController({
   client: createPaperClient(process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000"),
+  journal: createStorageJournal(), // REQUIRED: a journal, or null to accept losing protection on reload
   source: "backend",            // "fixture" for fixture-driven demos/tests
   pollIntervalMs: 3000,         // clamped to 2000–5000
   maxBackoffMs: 30000,
@@ -39,7 +41,7 @@ await ctl.prepare({ symbol, side: "buy", notional: "100.00" }); // or side "sell
 await ctl.confirm();            // ONLY from an explicit human click
 await ctl.cancel();             // ONLY from an explicit human click
 await ctl.checkStatus();        // "Consultar estado" (read-only)
-await ctl.resume(proposalId);   // follow an existing proposal (read-only)
+await ctl.resume(proposalId);   // follow an existing proposal (read-only; refused while an intent is pending)
 ctl.dispose();                  // abort requests, clear timers, ignore late responses
 ```
 
@@ -60,15 +62,66 @@ uncertain confirmation is resolved.
 - Permissions: `canPrepare`, `canConfirm`, `canCancel` and `canCheckStatus`.
 - Labels: `notice` ("Paper Trading — dinero ficticio") and `source`.
 
+## Recovery after reload (operation journal)
+
+**Problem fixed (review of `f2a6010`).** The screen stored only the proposal id and called
+`resume(id)` after a reload. Suppose a confirm response was lost and ATLAS still showed
+`open + not_submitted`:
+
+- the new controller came back in `review` with confirm enabled;
+- another click sent a second `POST /confirm`.
+
+The confirm intent lived only in memory.
+
+**Fix.** The intent is part of the controller and is stored durably before anything is sent.
+
+- **Format** (`journal.ts`, sessionStorage key `atlas.paperTrading.operation`):
+  `{ "v": 1, "proposalId": "…", "pendingConfirm": bool, "pendingCancel": bool }`.
+  It holds no amounts and no credentials.
+- **Write order:**
+  1. `confirm()` sets `pendingConfirm: true` and writes it synchronously;
+  2. then it takes the lock;
+  3. only then does it call the transport.
+
+  If the write fails, nothing is sent: `actionError.code = "JOURNAL_UNAVAILABLE"` and `journal: "unavailable"`. `cancel()` does the same with `pendingCancel`. No React effect is involved.
+- **Recovery:** the journal is read synchronously when the controller is created.
+  - With `pendingConfirm`, the very first state is `uncertain` (`canConfirm` and `canPrepare` false). It is never confirmable first and blocked later.
+  - Without it, the first state is `recovering`.
+  - A read-only `GET /proposals/{id}` then starts immediately, followed by the normal reads and reconciliation.
+- **When `pendingConfirm` is cleared** (only on a conclusive backend answer):
+  - a valid confirm response;
+  - a documented ATLAS error code (the request was processed, so no copy of it is pending);
+  - a read that shows anything other than `open + not_submitted`: `submitted`, `submitting`, `submission_unknown`, `rejected_by_broker` or `failed_before_submit`;
+  - backend `expired`, which is conclusive because the claim requires an unexpired proposal in the same transaction.
+
+  `open + not_submitted` is **not** proof, and a local timer never ends the uncertainty. `failed_before_submit` returns to `review`, and only a new human click confirms.
+- **`pendingCancel`** keeps cancel blocked after a reload until the order is read again.
+- **Unknown proposal:** a `404 PROPOSAL_NOT_FOUND` during recovery ends recovery (ATLAS cannot process a confirm for an unknown proposal) and clears the record. Other errors keep reading with backoff.
+- **Records are not deleted when an operation ends.** Flags are cleared, and the id stays so a reload keeps showing the operation. A new explicitly prepared operation replaces the record.
+- **`resume()` and `prepare()` are refused** while an intent is pending or recovery has not read the proposal.
+
+| Storage situation | Behaviour |
+|---|---|
+| Not available (access throws) | `journal: "unavailable"`; nothing is recovered; confirm and cancel are blocked; the screen says so |
+| Write fails (quota, privacy mode) | That confirm or cancel is not sent; `JOURNAL_UNAVAILABLE`; buttons stay disabled |
+| Corrupt JSON or no usable id | `journal: "invalid"`: the operation is unknown, so nothing is recovered and nothing becomes confirmable. A new operation must be prepared explicitly, and its record replaces the unreadable one |
+| Unknown version, or missing or malformed flags, but a usable id | Recovered with `pendingConfirm` and `pendingCancel` set (conservative) |
+| Legacy record from `f2a6010` (plain id under `atlas.paperTrading.proposalId`) | Recovered with `pendingConfirm: true`, because the old format never recorded intent. The legacy key is removed on the next write |
+
+**Scope.** sessionStorage covers one browser tab and its reloads. It is not a guarantee across
+tabs, windows or devices. The backend guarantees still hold independently: an atomic claim, at
+most one submission, and reconciliation without resending.
+
 ## States and transitions
 
 | Phase | Meaning | Allowed |
 |---|---|---|
 | `idle` | No operation | prepare |
+| `recovering` | Journal record without pending intent, proposal not read yet | check status |
 | `preparing` | `POST /proposals` in flight | — |
 | `review` | `open` + `not_submitted`/`failed_before_submit`, before `expiresAt` | confirm (human), prepare again |
 | `confirming` | `POST /confirm` in flight | — |
-| `uncertain` | Lost/aborted/invalid confirm response, or `submitting` / `submission_unknown` | check status only |
+| `uncertain` | Lost/aborted/invalid confirm response (also after a reload, from the journal), or `submitting` / `submission_unknown` | check status only |
 | `tracking` | `submitted`, broker status not final (incl. `pending_cancel`, `done_for_day`, `replaced`, `unrecognized`, missing) | check status; cancel (human) only for the statuses in "Cancellation policy" |
 | `final` | Broker `filled`/`canceled`/`expired`/`rejected`, or `rejected_by_broker` | prepare a new one |
 | `expired` | Unsent proposal past its TTL (local clock or backend) | prepare a new one |
@@ -167,7 +220,7 @@ After any outcome the controller reads the order again before offering another c
 - The confirm button calls `controller.confirm()` in its `onClick`, never in an effect. The same applies to cancel.
 - In `uncertain`, show only "Consultar estado" (`checkStatus()`), never a resend button.
 - Show `notice` permanently on every paper screen. Never place synthetic analysis prices next to paper data, and never turn a committee or report result into `prepare()` arguments.
-- **Persistence (optional, not implemented):** to survive a reload, a component may store only `proposal.id` (for example in `sessionStorage`) and call `resume(id)`. That is a convenience, not a broker guarantee: an order can still exist at Alpaca if the id is lost.
+- **Persistence:** pass `journal: createStorageJournal()` (sessionStorage) to the controller. Do not store ids yourself or call `resume()` on mount: the controller recovers by itself and keeps pending intents uncertain (see "Recovery after reload").
 
 ## Tests
 
@@ -259,7 +312,7 @@ Then run `./.venv/bin/uvicorn app.main:app --port 8000`. Details are in
   - why cancel is unavailable (`pending_cancel`, unknown status);
   - an uncertain banner with no resend button.
 - **Errors:** a readable message plus "Detalle técnico" (`code`, `message`, `correlationId`). No force-release or bypass controls exist.
-- **Reload:** the tab keeps only `proposal.id` in `sessionStorage` and resumes following it read-only on mount. If the id is lost, the order may still exist at Alpaca; this is not a broker guarantee.
+- **Reload:** the controller's journal (sessionStorage, this tab only) recovers the operation. A confirm or cancel sent before the reload stays uncertain until the backend answers conclusively, and a journal that cannot be written blocks confirm and cancel. See "Recovery after reload".
 - **Accessibility:**
   - visible labels and keyboard-reachable controls;
   - focus moves to the review, then to the status heading, only when the phase changes;

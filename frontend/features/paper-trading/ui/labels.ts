@@ -5,6 +5,7 @@ import type { Availability } from "./account";
 
 export const PHASE_LABEL: Record<Phase, string> = {
   idle: "Sin operación",
+  recovering: "Recuperando la operación de esta pestaña…",
   preparing: "Preparando propuesta…",
   review: "Propuesta lista para revisar",
   confirming: "Enviando confirmación…",
@@ -66,6 +67,7 @@ export function errorMessage(error: ControllerError, side: "buy" | "sell" | null
     case "NETWORK_ERROR": return "No hubo respuesta del backend. Si estabas confirmando, no repitas: consulta el estado.";
     case "ABORTED": return "La petición se interrumpió. Consulta el estado antes de repetir nada.";
     case "INVALID_RESPONSE": return "El backend devolvió datos inválidos o de otra operación. Las acciones quedan bloqueadas hasta una lectura coherente.";
+    case "JOURNAL_UNAVAILABLE": return "No se pudo guardar el registro de seguridad en esta pestaña (almacenamiento del navegador). Por seguridad no se envió nada.";
     case "INVALID_INPUT": return "Revisa los datos: símbolo y un importe o cantidad decimal (por ejemplo 100.00).";
     case "INVALID_REQUEST": return "El backend rechazó los datos de la solicitud.";
     case "INSUFFICIENT_BUYING_POWER": return "No hay poder de compra suficiente en la cuenta paper.";

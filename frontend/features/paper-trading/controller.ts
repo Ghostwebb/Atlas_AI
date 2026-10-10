@@ -7,6 +7,7 @@
  */
 import { PaperApiError, type createPaperClient } from "./client";
 import { PAPER_NOTICE, canCancel as policyCanCancel, canConfirm as policyCanConfirm, isFinalOrder, nextStatusRead } from "./policy";
+import type { JournalLoad, OperationJournal } from "./journal";
 import type { BrokerOrder, Proposal } from "./types";
 import {
   assertMatchesRequest, identityOf, parseCancel, parseOrder, parseProposal, proposalRequest, sameIdentity,
@@ -22,6 +23,13 @@ export interface Scheduler {
 
 export interface ControllerOptions {
   client: PaperClient;
+  /**
+   * Durable record of the operation and of pending confirm/cancel intents (see journal.ts).
+   * Required on purpose: pass a journal (the screen uses sessionStorage) or `null` to accept that a
+   * reload loses the protection. With a journal, a confirm/cancel is NOT sent unless its intent was
+   * stored first, and a recovered intent starts the controller as uncertain.
+   */
+  journal: OperationJournal | null;
   /** "fixture" for tests/demos with HTTP fixtures. A fixture is never a broker connection. */
   source?: "backend" | "fixture";
   now?: () => number;
@@ -33,7 +41,7 @@ export interface ControllerOptions {
 }
 
 export type Phase =
-  | "idle" | "preparing" | "review" | "confirming" | "uncertain" | "tracking" | "final" | "expired";
+  | "idle" | "recovering" | "preparing" | "review" | "confirming" | "uncertain" | "tracking" | "final" | "expired";
 
 export interface ControllerError {
   code: string; message: string; status: number; correlationId: string | null; proposalId: string | null;
@@ -65,6 +73,11 @@ export interface ControllerState {
    *  successful read does not clear it; it is cleared by the next action, a new operation, or when
    *  an uncertain confirmation is resolved by the backend. */
   readonly actionError: ControllerError | null;
+  /** Journal health: "off" (none configured), "ok", "unavailable" (confirm/cancel blocked),
+   *  "invalid" (an unreadable previous record was found; nothing could be recovered). */
+  readonly journal: "off" | "ok" | "unavailable" | "invalid";
+  /** How the operation was recovered after a reload, if it was. */
+  readonly recovered: null | "ok" | "legacy" | "incomplete" | "unknown_version";
   /** Delay in ms of the scheduled follow-up read, or null when none is scheduled. */
   readonly nextReadInMs: number | null;
   readonly canPrepare: boolean;
@@ -102,8 +115,13 @@ function toError(error: unknown): ControllerError {
 /** True only when ATLAS itself answered with a documented code (not network, abort or malformed data). */
 const isDefinite = (e: ControllerError) => e.status > 0 && BACKEND_CODES.has(e.code);
 
+const journalError = (): ControllerError => ({
+  code: "JOURNAL_UNAVAILABLE", status: 0, correlationId: null, proposalId: null,
+  message: "No se pudo registrar la intención en el almacenamiento de esta pestaña; no se envió nada.",
+});
+
 export function createPaperTradingController(options: ControllerOptions) {
-  const { client } = options;
+  const { client, journal } = options;
   const source = options.source ?? "backend";
   const now = options.now ?? (() => Date.now());
   const scheduler = options.scheduler ?? realScheduler;
@@ -124,6 +142,12 @@ export function createPaperTradingController(options: ControllerOptions) {
   let identity: OperationIdentity | null = null;
   let lastError: ControllerError | null = null;
   let actionError: ControllerError | null = null;
+  // Durable intents (mirrored into the journal) and recovery after a reload.
+  let intentConfirm = false;
+  let intentCancel = false;
+  let recoveryId: string | null = null;
+  let journalState: ControllerState["journal"] = journal ? "ok" : "off";
+  let recovered: ControllerState["recovered"] = null;
   let failures = 0;
   let readPromise: Promise<void> | null = null;
   let timer: unknown = null;
@@ -135,6 +159,8 @@ export function createPaperTradingController(options: ControllerOptions) {
 
   function phase(): Phase {
     if (busy === "prepare" && proposal === null) return "preparing";
+    // Recovered from the journal, not read yet: never confirmable before a conclusive read.
+    if (proposal === null && recoveryId !== null) return confirmUncertain ? "uncertain" : "recovering";
     if (proposal === null) return "idle";
     if (busy === "confirm") return "confirming";
     if (confirmUncertain) return "uncertain";
@@ -153,12 +179,35 @@ export function createPaperTradingController(options: ControllerOptions) {
     return Object.freeze({
       notice: PAPER_NOTICE, source, phase: ph, proposal, order, busy,
       reading: readPromise !== null, confirmUncertain, cancelUncertain, verifying, suspect, lastError, actionError,
+      journal: journalState, recovered,
       nextReadInMs: timerDelay,
       canPrepare: idleMutations && ["idle", "review", "expired", "final"].includes(ph),
-      canConfirm: idleMutations && ph === "review" && !verifying && !suspect && proposal !== null && policyCanConfirm(proposal, now()),
-      canCancel: idleMutations && ph === "tracking" && !cancelUncertain && !suspect && proposal !== null && policyCanCancel(proposal),
-      canCheckStatus: !disposed && (ph === "uncertain" || ph === "tracking" || verifying || cancelUncertain || suspect),
+      canConfirm: idleMutations && ph === "review" && !verifying && !suspect && journalState !== "unavailable" &&
+        proposal !== null && policyCanConfirm(proposal, now()),
+      canCancel: idleMutations && ph === "tracking" && !cancelUncertain && !suspect && journalState !== "unavailable" &&
+        proposal !== null && policyCanCancel(proposal),
+      canCheckStatus: !disposed && (ph === "uncertain" || ph === "recovering" || ph === "tracking" || verifying ||
+        cancelUncertain || suspect),
     });
+  }
+
+  /** Writes the current record. Returns false if a journal is configured and the write failed. */
+  function persist(): boolean {
+    const id = proposal?.id ?? recoveryId;
+    if (!journal || id === null) return true;
+    return journal.save({ v: 1, proposalId: id, pendingConfirm: intentConfirm, pendingCancel: intentCancel });
+  }
+
+  /** Only explicit backend states end a confirm intent. "open + not_submitted" does not:
+   *  the lost request may still be processed. Backend expiry is conclusive (the claim requires an
+   *  unexpired proposal in the same transaction); a local timer never is. */
+  function resolveConfirmIntent(local: Proposal) {
+    const proof = local.status === "expired" || local.submissionStatus !== "not_submitted";
+    if (!proof) return;
+    confirmUncertain = false;
+    intentConfirm = false;
+    actionError = null;
+    persist();
   }
 
   function emit() {
@@ -166,7 +215,20 @@ export function createPaperTradingController(options: ControllerOptions) {
     snapshot = build();
     for (const listener of [...listeners]) listener();
   }
+  // Recovery: load the journal synchronously, so the very first state is already uncertain when a
+  // confirm intent is pending (never confirmable first and blocked later).
+  if (journal) applyLoad(journal.load());
   snapshot = build();
+
+  function applyLoad(loaded: JournalLoad) {
+    if (loaded.kind === "unavailable") { journalState = "unavailable"; return; }
+    if (loaded.kind === "invalid") { journalState = "invalid"; return; }
+    if (loaded.kind === "empty") return;
+    recoveryId = loaded.record.proposalId;
+    intentConfirm = confirmUncertain = loaded.record.pendingConfirm;
+    intentCancel = cancelUncertain = loaded.record.pendingCancel;
+    recovered = loaded.note;
+  }
 
   function abortable() {
     const controller = new AbortController();
@@ -190,15 +252,16 @@ export function createPaperTradingController(options: ControllerOptions) {
 
   /** Is there anything to follow at the backend for the current operation? */
   function needsFollowUp(): boolean {
-    if (proposal === null || disposed) return false;
+    if (disposed) return false;
+    if (proposal === null) return recoveryId !== null;
     if (confirmUncertain || verifying || cancelUncertain) return true;
     return nextStatusRead(proposal) !== null;
   }
 
-  function scheduleNext() {
+  function scheduleNext(immediate = false) {
     clearTimer();
     if (!needsFollowUp()) return;
-    const delay = Math.min(maxBackoff, interval * 2 ** failures);
+    const delay = immediate ? 0 : Math.min(maxBackoff, interval * 2 ** failures);
     const mySession = session;
     timerDelay = delay;
     timer = scheduler.setTimeout(() => {
@@ -225,20 +288,36 @@ export function createPaperTradingController(options: ControllerOptions) {
 
   /** One follow-up read. Never confirms, never cancels, never resends. */
   async function readOnce(mySession: number, signal: AbortSignal) {
-    const p = proposal as Proposal;
     const stale = () => mySession !== session || disposed;
+    if (proposal === null && recoveryId !== null) {
+      // Recovery read: learn what ATLAS stored for the journaled operation. Never confirms.
+      const id = recoveryId;
+      let local: Proposal;
+      try {
+        local = parseProposal(await client.proposal(id, signal));
+      } catch (error) {
+        if (!stale() && error instanceof PaperApiError && error.code === "PROPOSAL_NOT_FOUND" && error.status === 404) {
+          // ATLAS has no such proposal, so no confirm for it can be processed: nothing to recover.
+          recoveryId = null; confirmUncertain = false; cancelUncertain = false;
+          intentConfirm = false; intentCancel = false;
+          journal?.clear();
+        }
+        throw error;
+      }
+      if (stale()) return;
+      acceptProposal(local, id);
+      recoveryId = null;
+      if (confirmUncertain) resolveConfirmIntent(local);
+      return;
+    }
+    const p = proposal as Proposal;
     if (confirmUncertain || verifying) {
       // First learn what ATLAS stored; reconcile on the next read if it says so.
       const local = parseProposal(await client.proposal(p.id, signal));
       if (stale()) return;
       acceptProposal(local, p.id);
       if (verifying) verifying = false;
-      if (confirmUncertain) {
-        // Only explicit backend states end the local uncertainty. "open + not_submitted" does not:
-        // the lost request may still be processed.
-        const proof = local.status === "expired" || local.submissionStatus !== "not_submitted";
-        if (proof) { confirmUncertain = false; actionError = null; }
-      }
+      if (confirmUncertain) resolveConfirmIntent(local);
       return;
     }
     const next = nextStatusRead(p);
@@ -262,6 +341,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     acceptProposal(refreshed, p.id);
     order = o;
     cancelUncertain = false;
+    if (intentCancel) { intentCancel = false; persist(); }
   }
 
   /** Runs one read; concurrent callers share it (one read in flight per operation). */
@@ -309,6 +389,7 @@ export function createPaperTradingController(options: ControllerOptions) {
     confirmUncertain = false; cancelUncertain = false; verifying = false; suspect = false;
     identity = null;
     lastError = null; actionError = null; failures = 0;
+    intentConfirm = false; intentCancel = false; recoveryId = null; recovered = null;
   }
 
   // --- public API ---------------------------------------------------------------
@@ -341,6 +422,7 @@ export function createPaperTradingController(options: ControllerOptions) {
       // The prepared proposal must be exactly the requested operation.
       assertMatchesRequest(p, body);
       acceptProposal(p, p.id);
+      if (journal) journalState = persist() ? "ok" : "unavailable";
       return { ok: true };
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
@@ -364,6 +446,16 @@ export function createPaperTradingController(options: ControllerOptions) {
     if (!snapshot.canConfirm || proposal === null || !policyCanConfirm(proposal, now())) {
       return { ok: false, reason: "not_allowed" };
     }
+    // Durable intent BEFORE the request, synchronously: if the page closes or reloads while the
+    // request is in flight, recovery starts uncertain. No stored intent → nothing is sent.
+    intentConfirm = true;
+    if (!persist()) {
+      intentConfirm = false;
+      journalState = "unavailable";
+      lastError = actionError = journalError();
+      emit();
+      return { ok: false, reason: "error" };
+    }
     busy = "confirm"; // synchronous lock: a second call before any render sees it
     actionError = null;
     const id = proposal.id;
@@ -378,14 +470,21 @@ export function createPaperTradingController(options: ControllerOptions) {
       acceptProposal(p, id);
       if (p.status !== "confirmed") throw new PaperApiError("Confirmación contradictoria.", "INVALID_RESPONSE");
       lastError = null;
+      intentConfirm = false; // conclusive: ATLAS claimed the proposal
+      persist();
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
       lastError = toError(error);
       actionError = lastError;
       // Definite answer from ATLAS: re-read before offering confirm again.
       // Anything else (network, abort, malformed, unknown code): the order MAY exist.
-      if (isDefinite(lastError)) verifying = true;
-      else confirmUncertain = true;
+      if (isDefinite(lastError)) {
+        // ATLAS processed this request and answered: no copy of it is still pending.
+        verifying = true;
+        intentConfirm = false;
+        persist();
+      } else confirmUncertain = true; // the intent stays recorded until a conclusive read
+
       result = { ok: false, reason: "error" };
     } finally {
       done();
@@ -405,6 +504,14 @@ export function createPaperTradingController(options: ControllerOptions) {
     if (disposed) return { ok: false, reason: "disposed" };
     if (busy !== null) return { ok: false, reason: "busy" };
     if (!snapshot.canCancel || proposal === null || !proposal.brokerOrderId) return { ok: false, reason: "not_allowed" };
+    intentCancel = true;
+    if (!persist()) {
+      intentCancel = false;
+      journalState = "unavailable";
+      lastError = actionError = journalError();
+      emit();
+      return { ok: false, reason: "error" };
+    }
     busy = "cancel"; // synchronous lock
     actionError = null;
     const orderId = proposal.brokerOrderId;
@@ -447,6 +554,8 @@ export function createPaperTradingController(options: ControllerOptions) {
   async function resume(proposalId: string): Promise<ActionResult> {
     if (disposed) return { ok: false, reason: "disposed" };
     if (busy !== null) return { ok: false, reason: "busy" };
+    // Never drop the protection of an operation whose confirm or cancel outcome is unknown.
+    if (confirmUncertain || cancelUncertain || recoveryId !== null) return { ok: false, reason: "not_allowed" };
     startOperation();
     const mySession = session;
     const { signal, done } = abortable();
@@ -454,6 +563,7 @@ export function createPaperTradingController(options: ControllerOptions) {
       const p = parseProposal(await client.proposal(proposalId, signal));
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
       acceptProposal(p, proposalId);
+      if (journal) journalState = persist() ? "ok" : "unavailable";
       return { ok: true };
     } catch (error) {
       if (mySession !== session || disposed) return { ok: false, reason: "disposed" };
@@ -481,6 +591,8 @@ export function createPaperTradingController(options: ControllerOptions) {
     controllers.clear();
     listeners.clear();
   }
+
+  if (recoveryId !== null) scheduleNext(true); // first recovery read; read-only
 
   return {
     getState: (): ControllerState => snapshot,

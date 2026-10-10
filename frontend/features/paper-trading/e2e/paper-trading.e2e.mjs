@@ -387,3 +387,156 @@ test('13. layout: no horizontal scroll on desktop and mobile', async () => {
     await context.close();
   }
 });
+
+// --- recovery after reload (review of f2a6010) ---------------------------------------------
+
+test('R1. lost confirmation + reload stays uncertain; backend evolution recovers without confirming again', async () => {
+  const { page, api, context } = await open();
+  await prepare(page, api);
+  await button(page, 'Confirmar orden paper').waitFor();
+  api.on(`POST /api/paper/proposals/${P}/confirm`, NETWORK);
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal())); // backend still shows open + not_submitted
+  await button(page, 'Confirmar orden paper').click();
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  await page.reload();
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  await settle(page);
+  assert.equal(await page.getByRole('button', { name: 'Confirmar orden paper' }).count(), 0, 'no confirm after reload');
+  await noResend(page);
+  await button(page, 'Consultar estado').click(); await settle(page);
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  assert.equal(await page.getByRole('button', { name: 'Confirmar orden paper' }).count(), 0);
+  // The backend evolves: submitting → (reconcile) in progress → uncertain → submitted.
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal({ status: 'confirmed', submissionStatus: 'submitting' })));
+  api.on(`POST /api/paper/proposals/${P}/reconcile`, err(409, 'SUBMISSION_IN_PROGRESS'), err(409, 'SUBMISSION_UNCERTAIN'),
+    ok(submitted()));
+  await button(page, 'Consultar estado').click(); await settle(page);
+  await text(page, 'Enviándose (lease activa)').waitFor();
+  for (let i = 0; i < 3; i++) { await button(page, 'Consultar estado').click(); await settle(page); }
+  await page.getByRole('heading', { name: 'Siguiendo la orden' }).waitFor();
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 1, 'POST /confirm stays at one');
+  await context.close();
+});
+
+const KEY = 'atlas.paperTrading.operation';
+const storedRecord = page => page.evaluate(k => JSON.parse(sessionStorage.getItem(k) ?? 'null'), KEY);
+async function seedAndReload(page, entries) {
+  await page.evaluate(e => { sessionStorage.clear(); for (const [k, v] of e) sessionStorage.setItem(k, v); }, entries);
+  await page.reload();
+}
+
+test('R2. reload while the confirm request is still in flight', async () => {
+  const { page, api, context } = await open();
+  await prepare(page, api);
+  await button(page, 'Confirmar orden paper').waitFor();
+  api.on(`POST /api/paper/proposals/${P}/confirm`, held()); // never answered
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal()));
+  await button(page, 'Confirmar orden paper').click();
+  await text(page, 'Confirmando…').waitFor();
+  assert.equal((await storedRecord(page)).pendingConfirm, true, 'intent stored before the response');
+  await page.reload();
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  await settle(page);
+  assert.equal(await page.getByRole('button', { name: 'Confirmar orden paper' }).count(), 0);
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 1);
+  await context.close();
+});
+
+test('R3. failed_before_submit after reload: review again, no automatic confirm', async () => {
+  const { page, api, context } = await open();
+  await prepare(page, api);
+  await button(page, 'Confirmar orden paper').waitFor();
+  api.on(`POST /api/paper/proposals/${P}/confirm`, NETWORK);
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal()));
+  await button(page, 'Confirmar orden paper').click();
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal({ submissionStatus: 'failed_before_submit' })));
+  await page.reload();
+  await page.getByRole('heading', { name: 'Revisa la propuesta antes de confirmar' }).waitFor();
+  await tick(page, 10_000);
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 1, 'a new human click is required');
+  assert.equal(await button(page, 'Confirmar orden paper').isDisabled(), false);
+  assert.equal((await storedRecord(page)).pendingConfirm, false);
+  await context.close();
+});
+
+test('R4. confirmed operation + reload keeps tracking with one polling loop', async () => {
+  const { page, api, context } = await open();
+  await toTracking(page, api);
+  api.always(`GET /api/paper/proposals/${P}`, ok(submitted()));
+  api.always(`GET /api/paper/orders/${O}`, ok(order()));
+  await page.reload();
+  await page.getByRole('heading', { name: 'Siguiendo la orden' }).waitFor();
+  await settle(page);
+  const start = api.count(`GET /api/paper/orders/${O}`);
+  await tick(page, 3000); await tick(page, 3000); await tick(page, 3000);
+  assert.equal(api.count(`GET /api/paper/orders/${O}`) - start, 3, 'no duplicate polling after reload (StrictMode)');
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 1);
+  await context.close();
+});
+
+test('R5. backend expiry after reload ends the uncertainty', async () => {
+  const { page, api, context } = await open();
+  await prepare(page, api);
+  await button(page, 'Confirmar orden paper').waitFor();
+  api.on(`POST /api/paper/proposals/${P}/confirm`, NETWORK);
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal()));
+  await button(page, 'Confirmar orden paper').click();
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal({ status: 'expired' })));
+  await page.reload();
+  await text(page, 'La propuesta venció sin enviarse').waitFor();
+  assert.equal(await button(page, 'Confirmar orden paper').isDisabled(), true);
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 1);
+  await context.close();
+});
+
+test('R6. storage write failure: no confirmation is sent', async () => {
+  const { page, api, context } = await open();
+  await prepare(page, api);
+  await button(page, 'Confirmar orden paper').waitFor();
+  await page.evaluate(() => { Storage.prototype.setItem = () => { throw new Error('QuotaExceededError'); }; });
+  await button(page, 'Confirmar orden paper').click();
+  await text(page, 'No se pudo guardar el registro de seguridad').waitFor();
+  await settle(page);
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 0);
+  assert.equal(await button(page, 'Confirmar orden paper').isDisabled(), true);
+  await context.close();
+});
+
+test('R7. corrupt record: nothing recovered; legacy id-only record: recovered as uncertain', async () => {
+  const { page, api, context } = await open();
+  await seedAndReload(page, [[KEY, '{"v":1,"proposalId":']]);
+  await text(page, 'no se pudo leer').waitFor();
+  await settle(page);
+  assert.equal(api.calls.filter(c => c.startsWith(`GET /api/paper/proposals`)).length, 0);
+  api.always(`GET /api/paper/proposals/${P}`, ok(proposal()));
+  await seedAndReload(page, [['atlas.paperTrading.proposalId', P]]);
+  await page.getByRole('heading', { name: 'Resultado incierto' }).waitFor();
+  await text(page, 'de formato anterior').waitFor();
+  assert.equal(await page.getByRole('button', { name: 'Confirmar orden paper' }).count(), 0);
+  assert.equal(api.count(`POST /api/paper/proposals/${P}/confirm`), 0);
+  await context.close();
+});
+
+test('R8. lost cancel + reload: cancel blocked until the order is read', async () => {
+  const { page, api, context } = await open();
+  await toTracking(page, api);
+  api.on(`POST /api/paper/orders/${O}/cancel`, NETWORK);
+  api.on(`GET /api/paper/orders/${O}`, held());
+  await button(page, 'Cancelar orden').click();
+  await text(page, 'No se confirmó el resultado de la cancelación').waitFor();
+  assert.equal((await storedRecord(page)).pendingCancel, true);
+  api.always(`GET /api/paper/proposals/${P}`, ok(submitted()));
+  await page.reload();
+  await page.getByRole('heading', { name: 'Siguiendo la orden' }).waitFor();
+  assert.equal(await button(page, 'Cancelar orden').isDisabled(), true);
+  api.always(`GET /api/paper/orders/${O}`, ok(order()));
+  await button(page, 'Consultar estado').click(); await settle(page);
+  await page.waitForFunction(() => {
+    const b = [...document.querySelectorAll('button')].find(x => x.textContent.includes('Cancelar orden'));
+    return b && !b.disabled;
+  });
+  assert.equal(api.count(`POST /api/paper/orders/${O}/cancel`), 1);
+  await context.close();
+});

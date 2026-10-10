@@ -4,6 +4,6 @@ set -e
 cd "$(dirname "$0")/../.."
 out=$(mktemp -d)
 ./node_modules/.bin/tsc features/paper-trading/types.ts features/paper-trading/client.ts \
-  features/paper-trading/policy.ts features/paper-trading/validate.ts features/paper-trading/controller.ts \
+  features/paper-trading/policy.ts features/paper-trading/validate.ts features/paper-trading/journal.ts features/paper-trading/controller.ts \
   --target ES2020 --module commonjs --strict --skipLibCheck --outDir "$out"
-PAPER_TEST_BUILD="$out" node --test features/paper-trading/contract.test.mjs features/paper-trading/controller.test.mjs features/paper-trading/identity-cancel.test.mjs
+PAPER_TEST_BUILD="$out" node --test features/paper-trading/contract.test.mjs features/paper-trading/controller.test.mjs features/paper-trading/identity-cancel.test.mjs features/paper-trading/recovery.test.mjs

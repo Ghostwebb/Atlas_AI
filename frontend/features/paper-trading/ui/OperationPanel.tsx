@@ -53,9 +53,33 @@ export function OperationPanel({ controller, state }: { controller: PaperTrading
   const side = p?.side ?? null;
   const live = <p className="pt-visually-hidden" aria-live="polite">{PHASE_LABEL[state.phase]}</p>;
 
+  const journalNotice = state.journal === "unavailable"
+    ? <p className="pt-error" role="alert">El almacenamiento de esta pestaña no está disponible. Confirmar y cancelar quedan
+      bloqueados porque no se podría recuperar su resultado tras recargar.</p>
+    : state.journal === "invalid"
+    ? <p className="pt-uncertain">Se encontró un registro de una operación anterior que no se pudo leer. No se ha recuperado
+      ninguna operación; revisa tus órdenes recientes antes de preparar otra.</p>
+    : null;
+
+  if (!p && (state.phase === "recovering" || state.phase === "uncertain")) {
+    return <section className="pt-card" aria-labelledby="pt-status-title">
+      {live}
+      <p className="label">OPERACIÓN RECUPERADA</p>
+      <h2 id="pt-status-title" ref={statusHeading} tabIndex={-1}>{PHASE_LABEL[state.phase]}</h2>
+      {state.confirmUncertain && <div className="pt-uncertain"><p><strong>Resultado incierto.</strong> Antes de recargar se
+        envió una confirmación sin respuesta. No se reenviará; solo se consulta el estado.</p></div>}
+      <Errors state={state} side={null} />
+      <div className="pt-actions">
+        <button type="button" className="pt-secondary" disabled={!state.canCheckStatus || state.reading}
+          onClick={() => { void controller.checkStatus(); }}>{state.reading ? "Consultando…" : "Consultar estado"}</button>
+      </div>
+    </section>;
+  }
+
   if (!p) {
     return <section className="pt-card" aria-labelledby="pt-op-title">
       {live}
+      {journalNotice}
       <p className="label">OPERACIÓN</p>
       <h2 id="pt-op-title">Sin operación activa</h2>
       <p className="pt-muted">Prepara una propuesta para revisarla aquí antes de confirmar.</p>
@@ -77,6 +101,9 @@ export function OperationPanel({ controller, state }: { controller: PaperTrading
 
   return <section className="pt-card" aria-labelledby={showReview ? "pt-review-title" : "pt-status-title"}>
     {live}
+    {journalNotice}
+    {state.recovered && state.recovered !== "ok" && <p className="pt-muted">Operación recuperada de un registro
+      {state.recovered === "legacy" ? " de formato anterior" : " incompleto"}: se trata como incierta hasta que el backend lo aclare.</p>}
     {showReview && <>
       <p className="label">REVISIÓN</p>
       <h2 id="pt-review-title" ref={reviewHeading} tabIndex={-1}>Revisa la propuesta antes de confirmar</h2>
