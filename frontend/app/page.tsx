@@ -3,135 +3,43 @@
 import { FormEvent, useState } from "react";
 import { AnalyzeError, analyzeSymbol } from "@/lib/api";
 import type { AnalyzeResponse } from "@/lib/types";
-import { ResultCard } from "@/components/ResultCard";
+import { NarrativePanel } from "@/components/NarrativePanel";
 
-type ViewState =
-  | { status: "idle" }
-  | { status: "loading"; symbol: string }
-  | { status: "success"; result: AnalyzeResponse }
-  | { status: "error"; kind: "invalid_symbol" | "network" | "server"; message: string };
-
-export default function Home() {
-  const [input, setInput] = useState("");
-  const [view, setView] = useState<ViewState>({ status: "idle" });
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const symbol = input.trim().toUpperCase();
-    if (!symbol) {
-      setView({
-        status: "error",
-        kind: "invalid_symbol",
-        message: "Please enter a stock symbol, for example NVDA.",
-      });
-      return;
-    }
-
-    setView({ status: "loading", symbol });
-    try {
-      const result = await analyzeSymbol(symbol);
-      setView({ status: "success", result });
-    } catch (error) {
-      const kind = error instanceof AnalyzeError ? error.kind : "server";
-      const message =
-        error instanceof Error ? error.message : "Something went wrong.";
-      setView({ status: "error", kind, message });
-    }
-  }
-
-  return (
-    <div className="flex min-h-screen flex-1 flex-col">
-      <header className="border-b border-[var(--border)] bg-[var(--surface)]/60 backdrop-blur">
-        <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-4">
-          <div className="flex items-center gap-3">
-            <span className="h-2.5 w-2.5 rounded-full bg-gradient-to-br from-violet-500 to-blue-500" />
-            <span className="text-lg font-semibold tracking-tight">ATLAS AI</span>
-          </div>
-          <span className="text-xs text-zinc-500">
-            Multi-Agent Investment Intelligence
-          </span>
-        </div>
-      </header>
-
-      <main className="mx-auto w-full max-w-5xl flex-1 px-6 py-12">
-        <section>
-          <h1 className="text-2xl font-semibold tracking-tight">Analyze a stock</h1>
-          <p className="mt-1 text-sm text-zinc-400">
-            Enter a US stock symbol to run the analysis on the demo dataset.
-          </p>
-
-          <form onSubmit={handleSubmit} className="mt-6 flex gap-3">
-            <label htmlFor="symbol" className="sr-only">
-              Stock symbol
-            </label>
-            <input
-              id="symbol"
-              type="text"
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              placeholder="NVDA"
-              autoComplete="off"
-              maxLength={12}
-              className="min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 py-3 font-mono text-base uppercase outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-500/30"
-            />
-            <button
-              type="submit"
-              disabled={view.status === "loading"}
-              className="rounded-lg bg-gradient-to-r from-violet-600 to-blue-600 px-6 py-3 text-sm font-medium transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {view.status === "loading" ? "Analyzing…" : "Analyze"}
-            </button>
-          </form>
-        </section>
-
-        <section className="mt-10" aria-live="polite">
-          {view.status === "idle" && <EmptyState />}
-
-          {view.status === "loading" && (
-            <div className="rounded-xl border border-[var(--border)] bg-[var(--surface)] p-8">
-              <div className="flex items-center gap-3 text-sm text-zinc-300">
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-violet-500 border-t-transparent" />
-                Running analysis for <span className="font-mono">{view.symbol}</span>…
-              </div>
-            </div>
-          )}
-
-          {view.status === "error" && (
-            <div
-              role="alert"
-              className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-6 text-sm text-rose-200"
-            >
-              <p className="font-medium">
-                {view.kind === "invalid_symbol"
-                  ? "Invalid stock symbol"
-                  : view.kind === "network"
-                    ? "Backend unavailable"
-                    : "Analysis failed"}
-              </p>
-              <p className="mt-1 text-rose-200/80">{view.message}</p>
-            </div>
-          )}
-
-          {view.status === "success" && <ResultCard result={view.result} />}
-        </section>
-      </main>
-
-      <footer className="border-t border-[var(--border)] px-6 py-4 text-center text-xs text-zinc-500">
-        ATLAS AI is an educational prototype running on synthetic demo data. It is not
-        investment advice and does not guarantee returns.
-      </footer>
-    </div>
-  );
+function AppIcon({ name }: { name: string }) {
+  const paths: Record<string, string> = { Home: "M3 10.5 12 3l9 7.5M5 9v11h5v-6h4v6h5V9", Cash: "M4 7h16v13H4zM4 7V4h13v3M16 12h4v4h-4z", Budgets: "M6 3h12v18H6zM9 8h6M9 12h6M9 16h3", Invest: "M4 20V12M10 20V8M16 20V4M3 6l6-3 6 2 6-3", Market: "M3 17l5-6 4 3 8-10M15 4h5v5M3 21h18", Help: "M9 9a3 3 0 0 1 6 0c0 2-3 2-3 5M12 17h.01M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0", Theme: "M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4 7 17M17 7l1.4-1.4M16 12a4 4 0 1 1-8 0 4 4 0 0 1 8 0" };
+  return <svg className="navigation-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={paths[name]} /></svg>;
 }
 
-function EmptyState() {
-  return (
-    <div className="rounded-xl border border-dashed border-[var(--border)] p-10 text-center">
-      <p className="text-sm text-zinc-400">
-        Enter a symbol such as <span className="font-mono text-zinc-200">AAPL</span>,{" "}
-        <span className="font-mono text-zinc-200">MSFT</span> or{" "}
-        <span className="font-mono text-zinc-200">NVDA</span> to begin.
-      </p>
-    </div>
-  );
+export default function Home() {
+  const [result, setResult] = useState<AnalyzeResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [symbolInput, setSymbolInput] = useState("");
+  const [activePage, setActivePage] = useState("Home");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [analysisError, setAnalysisError] = useState("");
+  const symbol = result?.symbol ?? "NVDA";
+  // Recommendation and confidence come only from the backend; no placeholder values.
+  const confidence = result ? Math.round(result.confidence * 100) : null;
+  async function runAnalysis(event?: FormEvent<HTMLFormElement>, selected?: string) {
+    event?.preventDefault();
+    const ticker = (selected ?? symbolInput).trim().toUpperCase();
+    if (!ticker || loading) return;
+    setSymbolInput(ticker); setLoading(true); setAnalysisError("");
+    try { setResult(await analyzeSymbol(ticker)); }
+    catch (error) { setAnalysisError(error instanceof AnalyzeError ? error.message : "Analysis unavailable. Check that the backend is running."); }
+    finally { setLoading(false); }
+  }
+  return <div className="app-canvas"><div className="ambient-glow" />
+    <aside className={`sidebar glass-surface ${menuOpen ? "menu-open" : ""}`}><div className="sidebar-brand"><div className="app-icon">✦</div><strong>ATLAS</strong><span>AI</span><button className="collapse-button" aria-label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} aria-controls="atlas-navigation" onClick={() => setMenuOpen(!menuOpen)}>{menuOpen ? "×" : "☰"}</button></div>
+      <div className="workspace-switcher"><div className="workspace-dot">A</div><div><strong>Atlas workspace</strong><small>Personal portfolio</small></div><span>⌄</span></div>
+      <nav id="atlas-navigation" className="side-nav" aria-label="Main navigation">{["Home", "Cash", "Budgets", "Invest", "Market", "Help"].map(name => <button key={name} className={activePage === name ? "side-link active" : "side-link"} aria-current={activePage === name ? "page" : undefined} onClick={() => { setActivePage(name); setMenuOpen(false); }}><span><AppIcon name={name} /></span>{name}{name === "Market" && <em>New</em>}</button>)}<div className="nav-rule" /><button className="side-link" onClick={() => setActivePage("Theme")}><span><AppIcon name="Theme" /></span>Theme</button></nav>
+      <div className="sidebar-bottom"><div className="user-row"><div className="user-avatar">CR</div><div><strong>Camilo Rodriguez</strong><small>Free account</small></div><span>•••</span></div><div className="sidebar-note">Your data stays private and secure.</div></div>
+    </aside>
+    <main className="main-content"><header className="main-header"><div><p className="breadcrumb">MY FINANCES <span>/</span> {activePage.toUpperCase()}</p><h1>Hi Camilo, <span>✦</span></h1><p className="subheading">Welcome back — here&apos;s what&apos;s moving today.</p></div><div className="header-actions"><form className="symbol-search" onSubmit={runAnalysis}><span>⌕</span><input value={symbolInput} onChange={e => setSymbolInput(e.target.value)} placeholder="Analyze ticker" aria-label="Analyze ticker" /><button type="submit">{loading ? "…" : "↵"}</button></form><button className="take-action">Take Action <b>+</b></button></div></header>
+      {analysisError && <p role="alert" className="analysis-error">{analysisError}</p>}
+      <NarrativePanel />
+      <div className="dashboard-layout"><div className="dashboard-primary"><section className="overview-card glass-card"><div className="section-top"><div><p className="label">NET WORTH <span className="demo-tag">Demo data</span></p><strong className="net-worth">$779,454.31</strong><span className="positive">↗ +7.92% <small>this month</small></span></div><div className="range-tabs">{["1D", "7D", "1M", "YTD", "1Y", "5Y", "All"].map(r => <button className={r === "7D" ? "selected" : ""} key={r}>{r}</button>)}</div></div><div className="net-chart"><div className="chart-tooltip"><strong>$779,454.31</strong><small>Today, 2:45 PM</small></div><svg viewBox="0 0 720 210" preserveAspectRatio="none" aria-label="Net worth chart"><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#b293e8" stopOpacity=".27" /><stop offset="1" stopColor="#b293e8" stopOpacity="0" /></linearGradient></defs><path d="M0,174 C43,164 55,151 90,157 C121,163 130,136 166,143 C207,151 224,119 257,127 C290,136 316,99 348,112 C380,125 390,83 426,95 C459,108 468,67 502,78 C534,88 558,44 588,58 C622,73 658,28 720,22 V210 H0Z" fill="url(#area)" /><path d="M0,174 C43,164 55,151 90,157 C121,163 130,136 166,143 C207,151 224,119 257,127 C290,136 316,99 348,112 C380,125 390,83 426,95 C459,108 468,67 502,78 C534,88 558,44 588,58 C622,73 658,28 720,22" fill="none" stroke="#b897ef" strokeWidth="2.5" /></svg><div className="x-axis">{["12 am", "3 am", "6 am", "9 am", "12 pm", "3 pm", "6 pm", "9 pm"].map(t => <span key={t}>{t}</span>)}</div></div></section>
+        <section className="stats-row"><article className="small-stat glass-card"><div><p className="label">INVESTMENTS <span className="demo-tag">Demo data</span></p><strong>$151,341.44</strong><small>Stocks · Crypto</small></div><button>⋯</button><div className="mini-bars">{Array.from({length: 8}, (_, i) => <i key={i} />)}</div></article><article className="small-stat glass-card"><div><p className="label">CASH BALANCE <span className="demo-tag">Demo data</span></p><strong>$322,498.32</strong><small>Available to spend</small></div><button>⋯</button><div className="mini-line"><svg viewBox="0 0 180 40"><path d="M0 33 C20 30 30 27 42 29 S66 14 79 21 S102 13 114 17 S143 4 180 8" fill="none" stroke="#83c7a2" strokeWidth="2" /></svg></div></article></section>
+        <section className="market-section"><div className="section-title"><div><p className="label">TODAY&apos;S MARKET <span className="demo-tag">Demo data</span></p><h2>What&apos;s moving now</h2><small>Keep an eye on the market&apos;s most interesting activity.</small></div><button className="view-link">View all →</button></div><div className="market-grid">{[["AAPL", "Apple Inc.", "+1.02%", "#99c5e8"], ["META", "Meta Platforms", "+0.86%", "#d8b4ef"], ["MSFT", "Microsoft Corp.", "+0.74%", "#8ad4b4"], ["AMZN", "Amazon.com", "+0.55%", "#efc38a"]].map(([ticker, name, change, color]) => <button className="market-tile" key={ticker} onClick={() => runAnalysis(undefined, ticker)}><div><span className="company-logo" style={{background: color}}>{ticker[0]}</span><strong>{ticker}</strong><small>{name}</small></div><span className="lock">↗</span><svg viewBox="0 0 150 36"><path d="M0 29 C12 22 18 28 28 21 S46 25 55 17 S70 24 82 18 S101 20 110 10 S131 17 150 5" fill="none" stroke={color} strokeWidth="2" /></svg><em>{change}</em></button>)}</div></section>
+      </div><aside className="dashboard-secondary"><section className="quick-card glass-card"><div className="quick-action"><span>✦</span><div><strong>Analyze a stock</strong><small>Get an explainable AI read</small></div><button onClick={() => runAnalysis(undefined, "NVDA")}>Go →</button></div><div className="quick-action"><span>↗</span><div><strong>Explore signals</strong><small>See what&apos;s changing today</small></div><button onClick={() => setActivePage("Market")}>View →</button></div><p className="tips">⌁ <span>Tip: Try analyzing a symbol above to open its full report.</span></p></section><section className="rewards-card glass-card"><div className="section-title"><div><p className="label">ATLAS REWARDS <span className="demo-tag">Demo data</span></p><h2>Insight score</h2></div><button className="month-select">Month⌄</button></div><div className="reward-ring"><div><strong>{confidence ?? "—"}</strong><small>{confidence === null ? "no analysis" : "confidence"}</small></div></div><div className="reward-legend"><span><i className="purple" /> Technical</span><b>+32</b><span><i className="pink" /> Risk</span><b>+24</b><span><i className="green" /> Fundamental</span><b>+16</b></div><button className="transfer-button">Share insight <span>→</span></button></section><section className="analysis-card glass-card"><div className="section-title"><div><p className="label">LATEST ANALYSIS</p><h2>{result ? `${result.symbol} report` : "No analysis yet"}</h2></div>{result ? <span className={`recommendation ${result.recommendation.toLowerCase()}`}>{result.recommendation}</span> : <span className="recommendation pending">—</span>}</div><p>{result?.summary ?? "Analyze a ticker to see the engine's recommendation."}</p>{result?.isSimulated && <p className="demo-tag">Analysis based on a synthetic demo dataset, not real market prices.</p>}<div className="confidence-line"><span>Confidence</span><strong>{confidence === null ? "—" : `${confidence}%`}</strong><div><i style={{width: `${confidence ?? 0}%`}} /></div></div><button className="transfer-button" onClick={() => runAnalysis(undefined, symbol)}>Open report <span>→</span></button></section></aside></div></main><footer className="footer-note">ATLAS AI · Explainable investment intelligence <span>Not financial advice</span></footer></div>;
 }
