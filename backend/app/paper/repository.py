@@ -18,6 +18,9 @@ Schema versions (PRAGMA user_version):
   2    Phase 5.5: reservations table, submit lease columns, conservative backfill
   3    Phase 5.6: cumulative fills per reservation (filled_qty, filled_notional) and
        ledger_checkpoints. Measures touched by pre-5.6 rows are marked unverifiable.
+  4    Phase 5.7 (data only): a 5.6 checkpoint that was ever moved, on a measure that
+       has ATLAS fills, may have adopted a stale snapshot (net-zero rule). It is marked
+       unverifiable. Checkpoints never moved after creation are kept.
 
 Ledger (Phase 5.6). Each ATLAS fill changes two measures:
   buy   cash -filled_notional, qty:<SYMBOL> +filled_qty
@@ -34,7 +37,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS proposals (
@@ -205,6 +208,8 @@ class Repository:
                     if statement.strip():
                         conn.execute(statement)
                 self._backfill_ledger(conn)
+            if version == 3:
+                self._distrust_moved_checkpoints(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -247,6 +252,22 @@ class Repository:
                 conn.execute(
                     "INSERT OR IGNORE INTO ledger_checkpoints (measure, value, base_effect, created_at, updated_at) "
                     "VALUES (?, NULL, '0', ?, ?)", (measure, row["updated_at"], row["updated_at"]))
+
+    @staticmethod
+    def _distrust_moved_checkpoints(conn: sqlite3.Connection) -> None:
+        filled_measures: set[str] = set()
+        for row in conn.execute(
+            "SELECT p.symbol, r.filled_qty, r.filled_notional FROM reservations r "
+            "JOIN proposals p ON p.id = r.proposal_id"
+        ).fetchall():
+            if Decimal(row["filled_qty"]) != 0 or Decimal(row["filled_notional"]) != 0:
+                filled_measures.update(measures_for(row["symbol"]))
+        for checkpoint in conn.execute(
+            "SELECT measure FROM ledger_checkpoints WHERE value IS NOT NULL AND updated_at != created_at"
+        ).fetchall():
+            if checkpoint["measure"] in filled_measures:
+                conn.execute("UPDATE ledger_checkpoints SET value = NULL WHERE measure = ?",
+                             (checkpoint["measure"],))
 
     # --- ledger --------------------------------------------------------------
 

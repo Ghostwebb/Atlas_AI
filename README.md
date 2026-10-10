@@ -307,6 +307,13 @@ snapshot but not the ledger, the answer is `RECONCILIATION_REQUIRED` until the b
 Order observations are monotonic. Pre-5.6 local data is marked unverifiable. See
 `docs/phase-5-paper-trading.md` → "Phase 5.6".
 
+**Phase 5.7 (checkpoints):** a zero net effect is not proof that no fills happened. A checkpoint follows
+the broker snapshot only while ATLAS has never observed a fill on that measure and has nothing
+active on it. After the first ATLAS fill it never moves again, so availability stays bounded by the
+ledger and increases made outside ATLAS are not used (conservative). Phase 5.6 databases are
+migrated (v3 → v4): checkpoints moved after fills become unverifiable. See
+`docs/phase-5-paper-trading.md` → "Phase 5.7".
+
 The backend has no authentication: run it locally only. Contract, states, errors, frontend
 guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).
 The check against a real Alpaca Paper account has not been run yet.

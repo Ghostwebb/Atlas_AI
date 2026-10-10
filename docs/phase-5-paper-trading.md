@@ -383,9 +383,9 @@ ATLAS records every fill it observes, cumulatively and per reservation (`filled_
 
 `ledger_checkpoints(measure, value, base_effect)` stores a trusted value per measure. It is created
 inside the claim transaction the first time ATLAS uses the measure, from the snapshot at that
-moment, when ATLAS has never touched it. It is moved to a new snapshot **only** while ATLAS has no
-active reservation and no fill since the checkpoint on that measure. A checkpoint therefore never
-moves to a snapshot that might lack an ATLAS fill.
+moment, when ATLAS has never touched it. Whether it can later move to a new snapshot is defined in
+**Phase 5.7** below: only while ATLAS has never observed a fill on that measure and has nothing
+active on it.
 
 ```text
 expected(measure) = checkpoint.value + (sum of ATLAS effects now − checkpoint.base_effect)
@@ -458,6 +458,57 @@ ledger and a sell also changes the cash ledger.
 - An order whose fills Alpaca already applies to a snapshot but does not yet report on the order
   itself cannot be detected. ATLAS assumes that an order's fill record is never behind its effect
   on the account or position.
+
+## Phase 5.7: a zero net effect is not proof of no fills
+
+### Defect fixed
+
+At `5fa3b84` a checkpoint moved to the current snapshot when nothing was active and the **net**
+ATLAS effect since the checkpoint was zero. A buy and a sell that cancel out leave a net effect of
+zero, yet both happened. A snapshot frozen between them carries an intermediate, higher value,
+and adopting it raised availability.
+
+| Reproduction (fake broker) | Before (`5fa3b84`) | After |
+|---|---|---|
+| Shares: position 1, buy 1 filled, freeze at 2, sell 1 filled (real 1), then two sales of 1 | Checkpoint 1 → 2, both sent: `['1', '1', '1']` | Checkpoint stays 1; first sent, second `RECONCILIATION_REQUIRED`: `['1', '1']` |
+| Cash: cash 100, sell filled (+100), freeze at 200, buy 100 filled (real 100), then two $100 buys | Checkpoint 100 → 200, both sent | Checkpoint stays 100; first sent, second `RECONCILIATION_REQUIRED` |
+
+### Invariant
+
+The snapshot may govern a measure (and its checkpoint may move to the snapshot) **only if ATLAS has
+never observed a fill on that measure and has no active reservation on it**. This uses the fill
+history (cumulative `filled_qty` / `filled_notional`, monotonic and persisted), not the net effect.
+Both paths use the same rule:
+- the pre-claim availability check (`_expected`);
+- the in-transaction checkpoint update (`_prepare_checkpoints`).
+
+All checkpoint writes were reviewed:
+- **Creation:** only when no reservation touches the measure; otherwise it is created unverifiable.
+- **Move:** only under the invariant.
+- **Migrations:** only ever set `NULL`.
+
+The local history proves that ATLAS fills happened, but it never proves that Alpaca reflects them.
+So after a fill, availability stays bounded by the ledger (`min(snapshot, ledger)`). It never
+relies on waits, repeated equal reads or an empty open-order list.
+
+### Permanent restriction
+
+After ATLAS observes the first fill on a measure, that measure's checkpoint **never moves again**.
+Consequences:
+- availability on it stays bounded by `checkpoint + ATLAS fills`;
+- decreases made outside ATLAS are still visible through the snapshot;
+- increases made outside ATLAS (for example a dashboard sale adding cash, or shares bought in the
+  dashboard) are not used by ATLAS.
+
+This is conservative, not unsafe, and there is deliberately no override. Before any ATLAS fill on a
+measure, the checkpoint keeps following the snapshot.
+
+### Migration (`user_version` 3 → 4, data only)
+
+A 5.6 checkpoint that was ever moved (`updated_at != created_at`) on a measure with ATLAS fills may
+have adopted a stale snapshot. It is set to unverifiable (`value NULL` →
+`RECONCILIATION_REQUIRED`), with the same documented recovery as Phase 5.6. Checkpoints never moved,
+or on measures without fills, are kept. The schema is unchanged.
 
 ## Audit trail
 

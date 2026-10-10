@@ -261,6 +261,17 @@ class PaperTradingService:
         position = snap["position"]
         return (dec(position.get("qty")) or Decimal(0)) if position else Decimal(0)
 
+    @staticmethod
+    def _snapshot_may_govern(rows: list[dict]) -> bool:
+        """Phase 5.7 invariant. A snapshot can only be trusted for a measure if ATLAS has
+        never observed a fill on it and nothing is in flight on it. The check uses the
+        fill HISTORY (cumulative filled_qty / filled_notional, monotonic and persisted),
+        never the net effect: fills that cancel out (buy then sell) still happened, and
+        a snapshot taken between them would carry an intermediate, higher value."""
+        ever_filled = any(Decimal(r["filled_qty"]) != 0 or Decimal(r["filled_notional"]) != 0 for r in rows)
+        active = any(r["state"] in ("held", "acknowledged") for r in rows)
+        return not ever_filled and not active
+
     def _expected(self, measure: str, conn=None) -> Expected:
         repo = self.repository
         rows = [r for r in repo.ledger_rows(conn) if measure in measures_for(r["symbol"])]
@@ -270,19 +281,22 @@ class PaperTradingService:
             return Expected(None, unverifiable=bool(rows))
         if checkpoint["value"] is None:
             return Expected(None, unverifiable=True)
+        if self._snapshot_may_govern(rows):
+            # Same rule the claim transaction uses to move the checkpoint to the snapshot.
+            return Expected(None)
         total = sum((effect(r, measure) for r in rows), Decimal(0))
         return Expected(Decimal(checkpoint["value"]) + total - Decimal(checkpoint["base_effect"]))
 
     def _prepare_checkpoints(self, conn, symbol: str, snap: dict) -> None:
         """Inside the claim transaction: create a checkpoint the first time a measure is
-        used, or move it to the snapshot while ATLAS has nothing on that measure
-        (no active reservation and no fill since the checkpoint)."""
+        used, or move it to the snapshot only while `_snapshot_may_govern` holds (ATLAS
+        has never observed a fill on the measure and nothing is active on it). After the
+        first ATLAS fill on a measure its checkpoint never moves again."""
         repo, now = self.repository, _iso(self._now())
         ledger = repo.ledger_rows(conn)
         for measure in measures_for(symbol):
             rows = [r for r in ledger if measure in measures_for(r["symbol"])]
             total = sum((effect(r, measure) for r in rows), Decimal(0))
-            active = any(r["state"] in ("held", "acknowledged") for r in rows)
             checkpoint = repo.checkpoint(measure, conn)
             if checkpoint is None:
                 if rows:
@@ -290,8 +304,7 @@ class PaperTradingService:
                                  "updated_at) VALUES (?, NULL, ?, ?, ?)", (measure, str(total), now, now))
                 else:
                     repo.put_checkpoint(conn, measure, self._snapshot_value(snap, measure), total, now)
-            elif checkpoint["value"] is not None and not active \
-                    and total == Decimal(checkpoint["base_effect"]):
+            elif checkpoint["value"] is not None and self._snapshot_may_govern(rows):
                 repo.put_checkpoint(conn, measure, self._snapshot_value(snap, measure), total, now)
 
     def _capacity_check(self, side: Side, symbol: str, amount: Decimal, snap: dict,
