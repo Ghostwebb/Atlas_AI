@@ -1,4 +1,4 @@
-"""ATLAS AI backend entrypoint (Phase 1)."""
+"""ATLAS AI backend entrypoint (Phase 2: demo dataset + deterministic engine)."""
 
 import os
 
@@ -7,7 +7,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.analysis import run_simulated_analysis
+from app.analysis.service import analyze_symbol
+from app.data.demo_provider import DemoDataProvider
+from app.data.provider import MarketDataProvider
 from app.schemas import AnalyzeRequest, AnalyzeResponse, ErrorResponse
 from app.symbols import is_valid_format
 
@@ -15,7 +17,10 @@ SERVICE_NAME = "atlas-ai-backend"
 INVALID_SYMBOL_ERROR = "Invalid stock symbol"
 INVALID_SYMBOL_MESSAGE = "Please provide a valid stock symbol."
 
-app = FastAPI(title="ATLAS AI Backend", version="0.1.0")
+# Swap this provider for a real one in later phases; routes do not change.
+market_data_provider: MarketDataProvider = DemoDataProvider()
+
+app = FastAPI(title="ATLAS AI Backend", version="0.2.0")
 
 _allowed_origins = [
     origin.strip()
@@ -61,7 +66,7 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse | JSONResponse:
     if not is_valid_format(payload.symbol):
         return _invalid_symbol_response(400)
 
-    result = run_simulated_analysis(payload.symbol)
+    result = analyze_symbol(payload.symbol, market_data_provider)
     if result is None:
         return _invalid_symbol_response(404)
     return result
