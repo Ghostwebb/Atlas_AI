@@ -195,7 +195,8 @@ fallback in both languages, connection/timeout/HTTP/malformed/busy cases and the
 `/api/report` contract. Phase 5 adds paper trading tests with a fake broker and a mocked
 HTTP transport (no test calls Alpaca): configuration guards, validation rules, idempotent and
 concurrent confirmation, uncertain submissions, reconciliation, restart recovery, fills,
-cancellation and the `/api/paper` contract.
+cancellation and the `/api/paper` contract. Phase 5.5 adds reservation tests across proposals
+(concurrency, stale snapshots, double counting, fills, migration, leases).
 
 Frontend checks:
 
@@ -289,6 +290,14 @@ Preparing a proposal never submits. Confirmation requires
 transaction plus a unique `client_order_id` enforce this. An uncertain result
 (`submission_unknown`) is reconciled by `client_order_id` and never resent. Analysis and
 narrative never create or confirm orders, and the synthetic analysis is never used for prices.
+
+**Phase 5.5 (reservations):** confirming a proposal reserves its cash or shares in SQLite in the
+same transaction that marks it as submitting, after re-checking capacity against every other
+active reservation. Two proposals can no longer commit the same shares or budget. An uncertain
+submission keeps its reservation until Alpaca reports the order as final. Capacity uses
+`min(broker figure, figure recomputed from the open-order list)` so stale snapshots cannot
+over-commit and acknowledged orders are not counted twice. New codes: `RESOURCE_RESERVED` and
+`RECONCILIATION_REQUIRED` (409). Existing Phase 5 databases are migrated in place.
 
 The backend has no authentication: run it locally only. Contract, states, errors, frontend
 guidance and the manual check are in [docs/phase-5-paper-trading.md](docs/phase-5-paper-trading.md).

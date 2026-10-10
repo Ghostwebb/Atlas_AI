@@ -151,9 +151,10 @@ Three separate lifecycles:
 5. Otherwise the proposal stays `submission_unknown`. It is **never resent**; the user calls
    `/reconcile` later or checks the Alpaca dashboard. To trade again, create a new proposal.
 
-**Restart:** on startup, `recover_pending()` turns every `submitting` proposal into
-`submission_unknown` (event `recovered_after_restart`) and reconciles it read-only before
-anything else can happen to it.
+**Restart:** on startup, `recover_pending()` turns every `submitting` proposal whose
+submission lease has expired into `submission_unknown` (event `recovered_after_restart`) and
+reconciles it read-only. Its reservation is kept throughout. A `submitting` proposal with a live
+lease belongs to another process and is left alone (see Phase 5.5).
 
 Alpaca's docs do not state what a duplicate `client_order_id` or a missing one on lookup
 returns, so ATLAS does not rely on resubmitting with the same id.
@@ -161,12 +162,11 @@ returns, so ATLAS does not rely on resubmitting with the same id.
 ## Business checks (prepare and again at confirm)
 
 Account `ACTIVE` and not blocked · market open · asset tradable US equity · `fractionable` for
-notional buys and fractional sells · buy ≤ `ATLAS_PAPER_MAX_ORDER_NOTIONAL_USD` · buy ≤
-`non_marginable_buying_power` · sell ≤ `qty_available` (Alpaca subtracts open orders) minus
-quantities of local sells whose outcome is still uncertain · long position required (no shorts).
-Missing broker data needed for a check fails the check (`BROKER_UNAVAILABLE`). Checks do not
-reserve funds; Alpaca remains the final authority. The sell side has no USD cap because no
-reference quote is used; it is bounded by the position.
+notional buys and fractional sells · buy ≤ `ATLAS_PAPER_MAX_ORDER_NOTIONAL_USD` · capacity
+(cash or shares) as defined in **Phase 5.5** below · long position required (no shorts).
+Missing broker data needed for a check fails the check (`BROKER_UNAVAILABLE`). Preparing does
+not reserve anything; confirmation reserves atomically. Alpaca remains the final authority. The
+sell side has no USD cap because no reference quote is used; it is bounded by the position.
 
 ## Cancellation
 
@@ -185,16 +185,174 @@ are never returned.
 | 400 | `INVALID_REQUEST`, `INVALID_CONFIRMATION` |
 | 403 | `ORIGIN_NOT_ALLOWED` |
 | 404 | `PROPOSAL_NOT_FOUND`, `ORDER_NOT_FOUND` |
-| 409 (state conflict) | `MARKET_CLOSED`, `PROPOSAL_EXPIRED`, `SUBMISSION_IN_PROGRESS`, `SUBMISSION_UNCERTAIN`, `ORDER_NOT_CANCELABLE` |
+| 409 (state conflict) | `MARKET_CLOSED`, `PROPOSAL_EXPIRED`, `SUBMISSION_IN_PROGRESS`, `SUBMISSION_UNCERTAIN`, `ORDER_NOT_CANCELABLE`, `RESOURCE_RESERVED`, `RECONCILIATION_REQUIRED` |
 | 422 (business rule) | `ACCOUNT_NOT_TRADABLE`, `ASSET_NOT_SUPPORTED`, `FRACTIONAL_NOT_SUPPORTED`, `ORDER_LIMIT_EXCEEDED`, `INSUFFICIENT_BUYING_POWER`, `INSUFFICIENT_POSITION`, `BROKER_REJECTED` |
 | 503 (unavailable) | `PAPER_DISABLED`, `PAPER_NOT_CONFIGURED`, `BROKER_UNAVAILABLE` |
+
+## Phase 5.5: atomic reservations
+
+### Defects fixed
+
+A review reproduced two defects at `a78bcac` with the fake broker. Both reproductions are now
+regression tests.
+
+| Defect | Before | After |
+|---|---|---|
+| A. Two sell proposals of 1 share, position 1, both validated before either claimed | Both sent: `['1', '1']` | One sent, the other `RESOURCE_RESERVED` |
+| B. A $100 buy left `submission_unknown`, budget $100, a second $100 buy | Second sent | `RECONCILIATION_REQUIRED`, nothing sent |
+
+The Phase 5 claim was atomic per proposal but not across proposals. Uncertain buys had no
+local protection.
+
+### Reservations table
+
+`reservations(proposal_id, resource_type cash|shares, symbol, amount, consumed, state,
+release_reason, broker_order_id, created_at, updated_at)`. Amounts are decimal strings summed
+with Python `Decimal` (never SQLite `REAL`). A partial unique index allows **one active
+reservation per proposal**. `CHECK` constraints require a symbol for shares and a release
+reason exactly when released.
+
+| State | Meaning | Counted against new orders |
+|---|---|---|
+| `held` | Claimed locally; Alpaca acknowledgement not observed (in flight or uncertain) | Full amount, unless its order appears in the fresh open-order list |
+| `acknowledged` | Alpaca order observed and not final | `amount - consumed`, unless its order appears in the fresh open-order list |
+| `released` | `not_sent`, `broker_rejected` or `order_terminal` | No |
+
+### Lifecycle
+
+| Event | Reservation |
+|---|---|
+| Prepare | None (nothing is reserved) |
+| Confirm | `held`, created in the **same transaction** as `open→confirmed/submitting` and the intent event |
+| Connection never established | `released (not_sent)`; the proposal can be confirmed again |
+| Timeout or other uncertain result | Stays `held`; read-only reconciliation; never resent |
+| Accepted | `acknowledged` (accepted is not executed) |
+| Partial fill | `acknowledged`, `consumed` updated; the pending part stays protected |
+| Fill / cancel / expiry / rejection reported by Alpaca | `released (order_terminal)`, with final `consumed` |
+| Explicit 4xx on submit | `released (broker_rejected)` |
+| Cancel requested (`pending_cancel`) | Stays `acknowledged` |
+| Restart | Rows persist; interrupted submissions become uncertain and keep `held` |
+
+Final statuses are the ones Alpaca documents as "no further updates": `filled`, `canceled`,
+`expired`, `rejected`. `replaced`, `done_for_day`, `calculated`, `pending_*`, `stopped`,
+`suspended` and unknown statuses keep the reservation. Nothing is released by a timeout, by a
+missing broker answer or by proposal expiry after the send started. A lookup that does not find
+the order does not release anything.
+
+All updates from order reads, reconciliation, recovery and cancellation go through one function
+that updates the proposal and its reservation in the same transaction.
+
+### Confirmation flow
+
+```text
+read broker: account, clock, asset, position (sells), open orders (status=open, limit 500)
+static checks; refresh known commitments from the fresh open-order list / per-order reads
+BEGIN IMMEDIATE
+  proposal open, not expired, not yet submitted         (conditional UPDATE)
+  re-check capacity against ALL active reservations      (other proposals included)
+  INSERT reservation 'held'; write submission_intent      (same transaction)
+COMMIT
+submit once (no transaction is open during HTTP)
+record the outcome and reservation state atomically
+```
+
+`BEGIN IMMEDIATE` takes SQLite's write lock, so claims from threads, repository instances and
+processes sharing the same file are serialized. The guarantee does not depend on an in-memory lock.
+
+### Snapshot policy and double counting
+
+Alpaca documents that open buy orders reduce buying power, that sells do not replenish it until
+executed, and that `qty_available` subtracts open orders. It does not document the freshness of
+the account and position snapshots, or their consistency with the order list. So capacity uses
+two independent views and takes the smaller:
+
+```text
+cash   = min(non_marginable_buying_power, cash - Σ open buy notional still held (open-order list))
+shares = min(qty_available, qty - Σ open sell remaining qty for the symbol (open-order list))
+free   = broker capacity - Σ active ATLAS reservations whose order is NOT in that open-order list
+```
+
+- An order already reflected by the snapshot is not subtracted twice (the first term), and an order
+  the snapshot does not reflect yet is still subtracted (the second term, or the local reservation).
+- A partially filled sell is counted only for its remaining quantity. The filled part already reduced
+  `qty`.
+- A full page of 500 open orders cannot prove completeness → `RECONCILIATION_REQUIRED`.
+- Open orders whose hold cannot be computed (qty-based buys or notional sells placed outside ATLAS)
+  are left to the broker's own figure (the first term).
+
+Decision: amount > broker capacity → `INSUFFICIENT_BUYING_POWER` / `INSUFFICIENT_POSITION`
+(definitive). Amount > `free` because of local commitments → `RECONCILIATION_REQUIRED` if any
+blocking reservation is uncertain, otherwise `RESOURCE_RESERVED` (temporary).
+
+### Multiple processes
+
+The process that claims a proposal stores `submit_owner` and a `submit_lease_until` (120 s; the
+HTTP timeout is 10 s). Recovery and `/reconcile` treat a `submitting` proposal as interrupted only
+after its lease has expired. Until then it returns `SUBMISSION_IN_PROGRESS` and counts as a held
+(not uncertain) reservation.
+
+### Migration
+
+On startup the repository upgrades Phase 5 databases in one transaction (`PRAGMA user_version`
+0 → 2). It adds the lease columns and the reservations table, and backfills **conservatively**:
+- `submitting` and `submission_unknown` → `held`;
+- `submitted` whose last known broker status is not final → `acknowledged`, with `consumed` taken
+  from the stored fills;
+- final or never-sent proposals → no reservation.
+
+Nothing is deleted or recreated, and the migration runs once.
+
+### New errors
+
+| Code | HTTP | Frontend message |
+|---|---|---|
+| `RESOURCE_RESERVED` | 409 | "Hay acciones comprometidas por otra orden" / "Hay presupuesto reservado por una operación pendiente" |
+| `RECONCILIATION_REQUIRED` | 409 | "Debes consultar el estado antes de intentar otra operación" |
+
+`proposal.reservation` (additive) shows `resourceType`, `symbol`, `amount`, `consumed`, `state`
+and `releaseReason`. There is no endpoint that forces the release of a reservation.
+
+Real backend output with the fake broker:
+
+```json
+{json.dumps(ex["reconciliation_required"], indent=2)}
+```
+
+```json
+{{
+  "error": "Paper trading state conflict",
+  "message": "Shares are committed by another order. Wait for it to finish or cancel it.",
+  "code": "RESOURCE_RESERVED",
+  "correlationId": "41843f3348b946bc878ed11ada6d7daa",
+  "proposalId": "d2602e0a1118428c9bb7d28099ca101d"
+}}
+```
+
+Reservation of an uncertain buy:
+
+```json
+{json.dumps(ex["uncertain_proposal_reservation"], indent=2)}
+```
+
+### Scope of the guarantees
+
+They cover ATLAS proposals that share this SQLite file. Orders placed from the Alpaca dashboard or
+other clients only count once Alpaca's snapshots or open-order list show them. Alpaca remains the
+final authority and may still reject an order.
+
+Residual risk: if the account or position snapshot is older than an order that has **already
+finished** (so it no longer appears in the open-order list) and ATLAS already recorded it as
+final, that order's effect is not visible in either view. The local check could then allow up to
+that amount. Alpaca's own buying-power and position checks still apply. SQLite on one machine is
+assumed; a network file system is not supported.
 
 ## Audit trail
 
 The SQLite `events` table records `proposal_created`, `validation_failed`, `submission_intent`,
 `broker_accepted`, `broker_rejected`, `submission_not_sent`, `submission_unknown`,
 `reconciled`, `reconcile_not_found`, `recovered_after_restart`, `order_status`,
-`proposal_expired`, `cancel_requested`, `cancel_rejected` and `cancel_result`, with ids,
+`proposal_expired`, `cancel_requested`, `cancel_rejected`, `cancel_result`, `order_observed`,
+`submission_lease_expired` and `reservation_backfilled`, with ids,
 timestamps, states, amounts and the correlation id. No secrets and no narrative text are stored.
 
 ## Examples
@@ -242,7 +400,7 @@ Proposal (`POST /api/paper/proposals`, 201):
   "warnings": [
     "Paper trading: simulated money in an Alpaca Paper account.",
     "Market order: the execution price is not known in advance and is not guaranteed.",
-    "These checks do not reserve funds or shares; Alpaca may still reject the order.",
+    "Preparing does not reserve funds or shares; confirmation re-checks them and Alpaca may still reject the order.",
     "ATLAS analysis uses a synthetic demo dataset. It is not market data and is not linked to paper orders, balances or prices."
   ]
 }
@@ -335,6 +493,11 @@ Sell larger than the available position (422):
   returned status (`pending_cancel` is not `canceled`).
 - Send mutating requests from the configured origin. Show `message` and `correlationId` on
   errors.
+- `RESOURCE_RESERVED`: show "Hay acciones comprometidas por otra orden" (sell) or "Hay
+  presupuesto reservado por una operación pendiente" (buy), with a link to the pending order.
+  `RECONCILIATION_REQUIRED`: show "Debes consultar el estado antes de intentar otra operación"
+  and offer **Check status** on the uncertain proposal. Never offer a button that releases a
+  reservation. You may show `proposal.reservation` (state, amount, consumed).
 - Generating the narrative report must never create or confirm an order.
 
 ## Tests
@@ -345,7 +508,10 @@ missing secrets, invalid amounts, assets, fractional rules, market closed, buyin
 positions and open orders, prepare-without-submit, confirm, expiry, immutability, duplicate and
 concurrent confirmations, timeout after acceptance, reconciliation, restart recovery, broker
 rejection, partial fills, cancellation races, persistence, sanitized errors, and no broker
-calls from analysis or narrative.
+calls from analysis or narrative. Phase 5.5 adds `tests/test_paper_reservations.py`: concurrent sells
+and buys across proposals, uncertain submissions, stale snapshots, double-count prevention,
+partial and full fills, cancellation, rejection, not-sent release, repeated confirmation, two
+repository instances, rollback, Phase 5 migration, recovery and process leases.
 
 ### Manual check with a real paper account (not run yet)
 
@@ -369,6 +535,7 @@ available in the development environment.
   model slippage, market impact or queue position; 10% of fillable paper orders get random
   partial fills).
 - Checks race with the broker: balances and positions can change between confirm and fill.
+  ATLAS reservations protect only ATLAS orders (see Phase 5.5, scope and residual risk).
 - An uncertain submission whose order never appears stays uncertain until the user checks Alpaca.
 - Polling only, no WebSocket updates. `done_for_day` and similar statuses need polling the next day.
 - SQLite is single-machine; delete `backend/var/` to reset local proposals (paper orders at

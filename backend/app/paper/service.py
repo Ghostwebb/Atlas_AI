@@ -1,10 +1,16 @@
-"""Paper trading service: proposals, confirmation, submission, reconciliation, cancel.
+"""Paper trading service: proposals, reservations, confirmation, submission, reconciliation.
 
-Flow:  prepare (validate, persist, never submit)
-       -> confirm (re-validate, atomic claim + persisted intent, single submit)
-       -> reconcile by client_order_id when the outcome is uncertain.
-No mutating call to Alpaca is ever retried automatically. A proposal whose
-outcome is uncertain is never resubmitted; it can only be reconciled.
+Flow:
+  prepare  read broker snapshot -> static checks -> capacity (no reservation) -> persist
+  confirm  read broker snapshot -> static checks -> refresh known commitments
+           -> ONE SQLite transaction: proposal open->confirmed/submitting, capacity
+              re-check against all active reservations, reservation 'held', intent event
+           -> submit once (no transaction open during HTTP)
+           -> persist outcome (and reservation state) atomically
+Uncertain outcomes keep their reservation and are reconciled, never resent.
+Every broker observation of an ATLAS order goes through `_observe_order`, so
+reads, reconciliation, recovery and cancellation apply the same policy to the
+proposal and its reservation together.
 """
 
 import logging
@@ -31,8 +37,10 @@ from app.paper.config import (
     PaperSettings,
 )
 from app.paper.models import (
+    TERMINAL_BROKER_STATUSES,
     Account,
     BrokerOrder,
+    BrokerOrderStatus,
     Check,
     Clock,
     ErrorCode,
@@ -41,10 +49,18 @@ from app.paper.models import (
     Position,
     Proposal,
     ProposalRequest,
+    Reservation,
     Side,
 )
 from app.paper.reconciliation import order_changes, order_matches, to_broker_order
-from app.paper.repository import Repository
+from app.paper.repository import Repository, consumed_amount
+from app.paper.reservations import (
+    OPEN_ORDERS_PAGE,
+    broker_cash,
+    broker_shares,
+    decide,
+    require_complete,
+)
 from app.paper.validation import dec, run_checks
 
 logger = logging.getLogger("atlas.paper")
@@ -56,11 +72,14 @@ ANALYSIS_NOTICE = (
 WARNINGS = [
     "Paper trading: simulated money in an Alpaca Paper account.",
     "Market order: the execution price is not known in advance and is not guaranteed.",
-    "These checks do not reserve funds or shares; Alpaca may still reject the order.",
+    "Preparing does not reserve funds or shares; confirmation re-checks them and Alpaca may still reject the order.",
     ANALYSIS_NOTICE,
 ]
 _ORDER_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _UNCERTAIN = ("submitting", "submission_unknown")
+# A submission is owned by the process that claimed it until this lease ends.
+# The HTTP timeout is 10 s, so an unexpired lease means the owner may still be sending.
+SUBMIT_LEASE_SECONDS = 120
 
 
 def _iso(moment: datetime) -> str:
@@ -74,6 +93,7 @@ class PaperTradingService:
         self.client = client
         self.repository = repository
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self.instance_id = uuid.uuid4().hex  # lease owner id for this process
 
     # --- guards -----------------------------------------------------------
 
@@ -144,18 +164,95 @@ class PaperTradingService:
         return Clock(isOpen=raw.get("is_open") is True, timestamp=raw.get("timestamp"),
                      nextOpen=raw.get("next_open"), nextClose=raw.get("next_close"))
 
-    # --- validation -------------------------------------------------------------
+    # --- central observation of ATLAS orders ------------------------------------
+
+    def _observe_order(self, row: dict, order: dict, correlation_id: str | None, kind: str,
+                       expected: tuple[str, ...] = ("submitting", "submission_unknown", "submitted")) -> bool:
+        """Apply a broker order to its proposal AND reservation in one transaction.
+
+        acknowledged while the order is not final; released (reason order_terminal)
+        only when Alpaca reports filled, canceled, expired or rejected. Consumption is
+        recorded from the broker's filled_qty / filled_avg_price.
+        """
+        if not order_matches(row, order):
+            logger.warning("paper order mismatch proposal=%s", row["id"])
+            return False
+        now = _iso(self._now())
+        status = BrokerOrderStatus.parse(order.get("status"))
+        terminal = status in TERMINAL_BROKER_STATUSES
+        consumed = consumed_amount(row["side"], order.get("filled_qty"), order.get("filled_avg_price"))
+        reservation = {
+            "state": "released" if terminal else "acknowledged",
+            "release_reason": "order_terminal" if terminal else None,
+            "broker_order_id": order["id"],
+            "consumed": str(consumed),
+            "updated_at": now,
+        }
+        return self.repository.transition(
+            row["id"], {"submission_status": expected}, order_changes(order, now),
+            self._event(row["id"], kind, correlation_id, broker_order_id=order["id"],
+                        broker_status=order.get("status"), filled_qty=order.get("filled_qty"),
+                        reservation_state=reservation["state"]),
+            reservation_changes=reservation,
+        )
+
+    # --- snapshot and capacity ----------------------------------------------------
+
+    def _snapshot(self, side: Side, symbol: str) -> dict:
+        client, _ = self._ready()
+        snap = {
+            "account": self._read(client.get_account),
+            "clock": self._read(client.get_clock),
+            "asset": self._read(lambda: client.get_asset(symbol)),
+            "position": self._read(lambda: client.get_position(symbol)) if side is Side.SELL else None,
+            "open_orders": self._read(lambda: client.list_orders("open", OPEN_ORDERS_PAGE)),
+        }
+        require_complete(snap["open_orders"])
+        return snap
+
+    def _resource(self, side: Side, symbol: str) -> tuple[str, str | None]:
+        return ("cash", None) if side is Side.BUY else ("shares", symbol)
+
+    def _refresh_commitments(self, side: Side, symbol: str, open_orders: list[dict],
+                             correlation_id: str | None) -> None:
+        """Use the fresh open-order list (and per-order reads) to update known
+        commitments before deciding. Never releases anything without a broker
+        observation of a final status."""
+        client, repo = self._ready()
+        by_client_id = {o.get("client_order_id"): o for o in open_orders}
+        for row in repo.active_reservations(*self._resource(side, symbol)):
+            proposal = repo.get_proposal(row["proposal_id"])
+            if proposal["submission_status"] == "submitting":
+                continue  # its owner will record the outcome
+            order = by_client_id.get(row["client_order_id"])
+            if order is None and row["state"] == "acknowledged" and row["broker_order_id"]:
+                order = self._read(lambda: client.get_order(row["broker_order_id"]))
+            if order is not None:
+                self._observe_order(proposal, order, correlation_id, "order_observed",
+                                    expected=("submission_unknown", "submitted"))
+
+    def _capacity_check(self, side: Side, symbol: str, amount: Decimal, snap: dict,
+                        rows: list[dict]) -> Check:
+        capacity = (broker_cash(snap["account"], snap["open_orders"]) if side is Side.BUY
+                    else broker_shares(snap["position"], snap["open_orders"], symbol))
+        open_ids = {o.get("client_order_id") for o in snap["open_orders"]}
+        now = _iso(self._now())
+        uncertain = {r["proposal_id"] for r in rows
+                     if r["submission_status"] == "submission_unknown"
+                     or (r["submission_status"] == "submitting" and (r["submit_lease_until"] or "") <= now)}
+        return decide(side, amount, capacity, rows, open_ids, uncertain)
 
     def _validate(self, side: Side, symbol: str, notional: Decimal | None, qty: Decimal | None,
-                  exclude_id: str | None = None) -> list[Check]:
-        client, repo = self._ready()
-        account = self._read(client.get_account)
-        clock = self._read(client.get_clock)
-        asset = self._read(lambda: client.get_asset(symbol))
-        position = self._read(lambda: client.get_position(symbol)) if side is Side.SELL else None
-        committed = repo.committed_sell_qty(symbol, exclude_id) if side is Side.SELL else []
-        return run_checks(self.settings, side, symbol, notional, qty, account, clock, asset,
-                          position, committed)
+                  correlation_id: str | None) -> tuple[list[Check], dict]:
+        _, repo = self._ready()
+        snap = self._snapshot(side, symbol)
+        checks = run_checks(self.settings, side, symbol, notional, qty,
+                            snap["account"], snap["clock"], snap["asset"])
+        self._refresh_commitments(side, symbol, snap["open_orders"], correlation_id)
+        amount = notional if side is Side.BUY else qty
+        rows = repo.active_reservations(*self._resource(side, symbol))
+        checks.append(self._capacity_check(side, symbol, amount, snap, rows))
+        return checks, snap
 
     # --- proposals -----------------------------------------------------------
 
@@ -164,7 +261,7 @@ class PaperTradingService:
         notional = Decimal(request.notional) if request.notional else None
         qty = Decimal(request.qty) if request.qty else None
         try:
-            checks = self._validate(request.side, request.symbol, notional, qty)
+            checks, _ = self._validate(request.side, request.symbol, notional, qty, correlation_id)
         except PaperError as error:
             repo.add_event(self._event(None, "validation_failed", correlation_id, stage="prepare",
                                        symbol=request.symbol, side=request.side.value, code=error.code.value))
@@ -197,7 +294,7 @@ class PaperTradingService:
         repo.insert_proposal(row, self._event(
             proposal_id, "proposal_created", correlation_id, symbol=row["symbol"], side=row["side"],
             notional=row["notional"], qty=row["qty"], client_order_id=row["client_order_id"]))
-        return self._to_proposal(row)
+        return self._to_proposal(repo.get_proposal(proposal_id))
 
     def get_proposal(self, proposal_id: str) -> Proposal:
         _, repo = self._ready()
@@ -212,6 +309,8 @@ class PaperTradingService:
         return row
 
     def _expire_if_due(self, repo: Repository, row: dict, correlation_id: str | None) -> dict:
+        # Only proposals that were never sent can expire; a submission in flight or
+        # uncertain is never released by expiry.
         now = _iso(self._now())
         if row["status"] == "open" and row["submission_status"] in ("not_submitted", "failed_before_submit") \
                 and now >= row["expires_at"]:
@@ -248,26 +347,45 @@ class PaperTradingService:
 
         side = Side(row["side"])
         notional, qty = dec(row["notional"]), dec(row["qty"])
+        amount = notional if side is Side.BUY else qty
         try:
-            checks = self._validate(side, row["symbol"], notional, qty, exclude_id=proposal_id)
+            checks, snap = self._validate(side, row["symbol"], notional, qty, correlation_id)
         except PaperError as error:
             repo.add_event(self._event(proposal_id, "validation_failed", correlation_id,
                                        stage="confirm", code=error.code.value))
             error.proposal_id = proposal_id
             raise
 
-        now = _iso(self._now())
-        claimed = repo.transition(
-            proposal_id,
-            {"status": ("open",), "submission_status": ("not_submitted", "failed_before_submit")},
-            {"status": "confirmed", "submission_status": "submitting", "last_error_code": None,
-             "updated_at": now},
-            self._event(proposal_id, "submission_intent", correlation_id,
-                        client_order_id=row["client_order_id"], symbol=row["symbol"], side=row["side"],
-                        notional=row["notional"], qty=row["qty"],
-                        checks=[c.name for c in checks if c.passed]),
-            extra_where="expires_at > ?", extra_params=(now,),
-        )
+        now_dt = self._now()
+        now = _iso(now_dt)
+        resource_type, symbol = self._resource(side, row["symbol"])
+
+        def recheck(rows: list[dict]) -> None:
+            # Inside the write transaction: other proposals' reservations committed
+            # after our snapshot are visible here and are subtracted.
+            self._capacity_check(side, row["symbol"], amount, snap, rows)
+
+        try:
+            claimed = repo.claim(
+                proposal_id,
+                {"status": ("open",), "submission_status": ("not_submitted", "failed_before_submit")},
+                {"status": "confirmed", "submission_status": "submitting", "last_error_code": None,
+                 "submit_owner": self.instance_id,
+                 "submit_lease_until": _iso(now_dt + timedelta(seconds=SUBMIT_LEASE_SECONDS)),
+                 "updated_at": now},
+                {"resource_type": resource_type, "symbol": symbol, "amount": str(amount), "created_at": now},
+                self._event(proposal_id, "submission_intent", correlation_id,
+                            client_order_id=row["client_order_id"], symbol=row["symbol"], side=row["side"],
+                            notional=row["notional"], qty=row["qty"], reservation=str(amount),
+                            resource=resource_type, checks=[c.name for c in checks if c.passed]),
+                recheck,
+                extra_where="expires_at > ?", extra_params=(now,),
+            )
+        except PaperError as error:
+            repo.add_event(self._event(proposal_id, "validation_failed", correlation_id,
+                                       stage="claim", code=error.code.value))
+            error.proposal_id = proposal_id
+            raise
         if not claimed:
             # Another confirmation won the race, or the proposal just expired.
             row = self._expire_if_due(repo, repo.get_proposal(proposal_id), correlation_id)
@@ -287,33 +405,35 @@ class PaperTradingService:
         except Exception:  # noqa: BLE001 - anything after the claim leaves the outcome uncertain
             logger.exception("paper submit raised proposal=%s correlation=%s", proposal_id, correlation_id)
             result = SubmitResult(SubmitOutcome.UNKNOWN, detail="client exception")
-        return self._apply_submit_result(repo, client, row, result, correlation_id)
+        return self._apply_submit_result(repo, repo.get_proposal(proposal_id), result, correlation_id)
 
-    def _apply_submit_result(self, repo, client, row, result, correlation_id) -> Proposal:
+    def _apply_submit_result(self, repo: Repository, row: dict, result: SubmitResult,
+                             correlation_id: str) -> Proposal:
         pid, now = row["id"], _iso(self._now())
         submitting = {"submission_status": ("submitting",)}
         if result.outcome is SubmitOutcome.ACCEPTED and order_matches(row, result.order):
-            repo.transition(pid, submitting, order_changes(result.order, now),
-                            self._event(pid, "broker_accepted", correlation_id,
-                                        broker_order_id=result.order["id"],
-                                        broker_status=result.order.get("status")))
+            self._observe_order(row, result.order, correlation_id, "broker_accepted", expected=("submitting",))
             return self._to_proposal(repo.get_proposal(pid))
         if result.outcome is SubmitOutcome.REJECTED:
             repo.transition(pid, submitting,
                             {"submission_status": "rejected_by_broker",
                              "last_error_code": ErrorCode.BROKER_REJECTED.value, "updated_at": now},
-                            self._event(pid, "broker_rejected", correlation_id, http_status=result.http_status))
+                            self._event(pid, "broker_rejected", correlation_id, http_status=result.http_status),
+                            reservation_changes={"state": "released", "release_reason": "broker_rejected",
+                                                 "updated_at": now})
             raise PaperError(ErrorCode.BROKER_REJECTED, "Alpaca Paper rejected this order.", pid)
         if result.outcome is SubmitOutcome.NOT_SENT:
             # The connection was never established: nothing reached Alpaca.
             repo.transition(pid, submitting,
                             {"status": "open", "submission_status": "failed_before_submit",
                              "last_error_code": ErrorCode.BROKER_UNAVAILABLE.value, "updated_at": now},
-                            self._event(pid, "submission_not_sent", correlation_id, detail=result.detail))
+                            self._event(pid, "submission_not_sent", correlation_id, detail=result.detail),
+                            reservation_changes={"state": "released", "release_reason": "not_sent",
+                                                 "updated_at": now})
             raise PaperError(ErrorCode.BROKER_UNAVAILABLE,
                              "Alpaca Paper was not reachable; the order was not sent.", pid)
 
-        # UNKNOWN (or an accepted body that does not match the proposal).
+        # UNKNOWN (or an accepted body that does not match): the reservation stays held.
         repo.transition(pid, submitting,
                         {"submission_status": "submission_unknown",
                          "last_error_code": ErrorCode.SUBMISSION_UNCERTAIN.value, "updated_at": now},
@@ -329,54 +449,67 @@ class PaperTradingService:
 
     # --- reconciliation ----------------------------------------------------
 
+    def _lease_expired(self, row: dict) -> bool:
+        return (row.get("submit_lease_until") or "") <= _iso(self._now())
+
+    def _mark_interrupted(self, repo: Repository, row: dict, correlation_id: str | None, kind: str) -> None:
+        repo.transition(row["id"], {"submission_status": ("submitting",)},
+                        {"submission_status": "submission_unknown",
+                         "last_error_code": ErrorCode.SUBMISSION_UNCERTAIN.value,
+                         "updated_at": _iso(self._now())},
+                        self._event(row["id"], kind, correlation_id),
+                        extra_where="(submit_lease_until IS NULL OR submit_lease_until <= ?)",
+                        extra_params=(_iso(self._now()),))
+
     def reconcile(self, proposal_id: str, correlation_id: str | None) -> Proposal:
         client, repo = self._ready()
         row = self._load(repo, proposal_id)
         if row["submission_status"] not in ("submitting", "submission_unknown", "submitted"):
             return self._to_proposal(self._expire_if_due(repo, row, correlation_id))
         if row["submission_status"] == "submitting":
-            raise PaperError(ErrorCode.SUBMISSION_IN_PROGRESS,
-                             "This proposal is being submitted. Check its status.", proposal_id)
+            if not self._lease_expired(row):
+                raise PaperError(ErrorCode.SUBMISSION_IN_PROGRESS,
+                                 "This proposal is being submitted. Check its status.", proposal_id)
+            self._mark_interrupted(repo, row, correlation_id, "submission_lease_expired")
+            row = repo.get_proposal(proposal_id)
 
         if row["broker_order_id"]:
             order = self._read(lambda: client.get_order(row["broker_order_id"]))
         else:
             order = self._read(lambda: client.get_order_by_client_id(row["client_order_id"]))
-        now = _iso(self._now())
         if order is None or not order_matches(row, order):
             repo.add_event(self._event(proposal_id, "reconcile_not_found", correlation_id,
                                        client_order_id=row["client_order_id"]))
             if row["submission_status"] == "submission_unknown":
+                # Not finding the order does not prove it was never sent: keep protection.
                 raise PaperError(ErrorCode.SUBMISSION_UNCERTAIN,
                                  "No matching order was found yet. The proposal stays uncertain and will not be resent.",
                                  proposal_id)
             raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The broker order was not found.", proposal_id)
 
-        repo.transition(proposal_id, {"submission_status": ("submission_unknown", "submitted")},
-                        order_changes(order, now),
-                        self._event(proposal_id, "reconciled", correlation_id, broker_order_id=order["id"],
-                                    broker_status=order.get("status"), filled_qty=order.get("filled_qty")))
+        self._observe_order(row, order, correlation_id, "reconciled",
+                            expected=("submission_unknown", "submitted"))
         return self._to_proposal(repo.get_proposal(proposal_id))
 
     def recover_pending(self) -> list[str]:
-        """Startup recovery: in-flight submissions become uncertain, then are reconciled (read-only)."""
+        """Startup recovery: submissions whose lease expired become uncertain and are
+        reconciled read-only. Reservations are kept (and never dropped) throughout.
+        Submissions with a live lease belong to another process and are left alone."""
         if not self.settings.enabled or self.repository is None:
             return []
         repo = self.repository
         recovered = []
         for row in repo.list_by_submission(_UNCERTAIN):
             if row["submission_status"] == "submitting":
-                repo.transition(row["id"], {"submission_status": ("submitting",)},
-                                {"submission_status": "submission_unknown",
-                                 "last_error_code": ErrorCode.SUBMISSION_UNCERTAIN.value,
-                                 "updated_at": _iso(self._now())},
-                                self._event(row["id"], "recovered_after_restart", None))
+                if not self._lease_expired(row):
+                    continue
+                self._mark_interrupted(repo, row, None, "recovered_after_restart")
             recovered.append(row["id"])
             if self.client is not None and self.settings.configured:
                 try:
                     self.reconcile(row["id"], None)
                 except PaperError:
-                    pass  # stays submission_unknown; visible to the user
+                    pass  # stays submission_unknown with its reservation; visible to the user
         return recovered
 
     # --- orders -------------------------------------------------------------------
@@ -406,10 +539,8 @@ class PaperTradingService:
             raise PaperError(ErrorCode.ORDER_NOT_FOUND, "The order does not exist.")
         row = self._proposal_for(repo, order)
         if row is not None:
-            repo.transition(row["id"], {"submission_status": ("submitted", "submission_unknown")},
-                            order_changes(order, _iso(self._now())),
-                            self._event(row["id"], "order_status", correlation_id,
-                                        broker_status=order.get("status"), filled_qty=order.get("filled_qty")))
+            self._observe_order(row, order, correlation_id, "order_status",
+                                expected=("submitted", "submission_unknown"))
         return to_broker_order(order, row["id"] if row else None)
 
     def cancel_order(self, order_id: str, correlation_id: str) -> dict:
@@ -431,6 +562,7 @@ class PaperTradingService:
         except BrokerUnavailable:
             raise PaperError(ErrorCode.BROKER_UNAVAILABLE, "Alpaca Paper is not reachable right now.") from None
         # A 204 means "cancel requested", not "canceled": report Alpaca's current status.
+        # The reservation follows the observed status (pending_cancel keeps it).
         order = self.get_order(order_id, correlation_id)
         repo.add_event(self._event(linked_id, "cancel_result", correlation_id, broker_order_id=order_id,
                                    broker_status=order.status.value))
@@ -438,8 +570,15 @@ class PaperTradingService:
 
     # --- serialization -------------------------------------------------------------
 
-    @staticmethod
-    def _to_proposal(row: dict) -> Proposal:
+    def _to_proposal(self, row: dict) -> Proposal:
+        latest = self.repository.latest_reservation(row["id"]) if self.repository else None
+        reservation = None
+        if latest is not None:
+            reservation = Reservation(
+                resourceType=latest["resource_type"], symbol=latest["symbol"],
+                amount=Decimal(latest["amount"]), consumed=Decimal(latest["consumed"]),
+                state=latest["state"], releaseReason=latest["release_reason"],
+            )
         return Proposal(
             id=row["id"], environment=row["environment"], symbol=row["symbol"], side=row["side"],
             notional=dec(row["notional"]), qty=dec(row["qty"]), orderType=row["order_type"],
@@ -449,5 +588,5 @@ class PaperTradingService:
             brokerOrderId=row["broker_order_id"], brokerStatus=row["broker_status"],
             filledQty=dec(row["filled_qty"]), filledAvgPrice=dec(row["filled_avg_price"]),
             lastErrorCode=row["last_error_code"], checks=row["checks"], warnings=row["warnings"],
-            updatedAt=row["updated_at"],
+            updatedAt=row["updated_at"], reservation=reservation,
         )

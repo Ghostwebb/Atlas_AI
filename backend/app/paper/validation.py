@@ -1,6 +1,7 @@
 """Deterministic pre-trade checks, run when preparing AND again when confirming.
 
-Inputs are broker snapshots (account, clock, asset, position) plus local state.
+Inputs are broker snapshots (account, clock, asset). Capacity (buying power,
+shares) lives in reservations.py.
 Missing data needed for a decision is treated as failure, never as "safe".
 Passing these checks does not reserve funds or guarantee acceptance: Alpaca
 remains the final authority. ATLAS's synthetic prices are never used here.
@@ -30,8 +31,8 @@ def _fail(checks: list[Check], name: str, detail: str, code: ErrorCode, message:
 
 
 def run_checks(settings: PaperSettings, side: Side, symbol: str, notional: Decimal | None,
-               qty: Decimal | None, account: dict, clock: dict, asset: dict | None,
-               position: dict | None, committed_sell_qty: list[str]) -> list[Check]:
+               qty: Decimal | None, account: dict, clock: dict, asset: dict | None) -> list[Check]:
+    """Static checks: account, session, asset, fractional rules and the per-order limit."""
     checks: list[Check] = []
 
     # Account
@@ -70,31 +71,7 @@ def run_checks(settings: PaperSettings, side: Side, symbol: str, notional: Decim
                   f"The amount exceeds the configured limit of {settings.max_order_notional} USD.")
         checks.append(Check(name="order_limit", passed=True,
                             detail=f"{notional} <= {settings.max_order_notional} USD"))
-        # No leverage requested by the app: the order must fit non-marginable buying power.
-        available = dec(account.get("non_marginable_buying_power"))
-        if available is None:
-            _fail(checks, "buying_power", "buying power not reported", ErrorCode.BROKER_UNAVAILABLE,
-                  "The broker did not report buying power; the order cannot be validated.")
-        if notional > available:
-            _fail(checks, "buying_power", f"{notional} > {available}", ErrorCode.INSUFFICIENT_BUYING_POWER,
-                  "Not enough non-marginable buying power in the paper account.")
-        checks.append(Check(name="buying_power", passed=True,
-                            detail=f"{notional} <= {available} non-marginable buying power"))
-    else:
-        if position is None or position.get("side") != "long":
-            _fail(checks, "position", f"no long position in {symbol}", ErrorCode.INSUFFICIENT_POSITION,
-                  f"There is no long {symbol} position to reduce. Short sales are not allowed.")
-        available = dec(position.get("qty_available"))
-        if available is None:
-            _fail(checks, "position", "qty_available not reported", ErrorCode.BROKER_UNAVAILABLE,
-                  "The broker did not report the available quantity; the order cannot be validated.")
-        committed = sum((dec(q) or Decimal(0) for q in committed_sell_qty), Decimal(0))
-        free = available - committed
-        if qty > free:
-            _fail(checks, "position", f"{qty} > {free} (available {available}, uncertain local sells {committed})",
-                  ErrorCode.INSUFFICIENT_POSITION,
-                  "The quantity exceeds the shares available after open and pending orders.")
-        checks.append(Check(name="position", passed=True,
-                            detail=f"{qty} <= {free} (available {available}, uncertain local sells {committed})"))
+    # Buying power and position capacity are decided in reservations.py, together
+    # with local reservations (and re-checked inside the claim transaction).
 
     return checks

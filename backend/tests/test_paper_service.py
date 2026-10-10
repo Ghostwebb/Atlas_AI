@@ -139,7 +139,8 @@ def test_uncertain_local_sells_are_committed(svc, broker):
     broker.submit_mode = "unknown_missing"
     first = svc.create_proposal(sell(qty="4"), "c")
     expect(ErrorCode.SUBMISSION_UNCERTAIN, lambda: svc.confirm(first.id, "c"))
-    expect(ErrorCode.INSUFFICIENT_POSITION, lambda: svc.create_proposal(sell(qty="2"), "c"))
+    # Phase 5.5: blocked by an uncertain local sell -> check status first (not a definitive shortage).
+    expect(ErrorCode.RECONCILIATION_REQUIRED, lambda: svc.create_proposal(sell(qty="2"), "c"))
     assert svc.create_proposal(sell(qty="1"), "c").qty == Decimal("1")
 
 

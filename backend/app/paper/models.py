@@ -71,10 +71,25 @@ class BrokerOrderStatus(str, Enum):
             return cls.UNRECOGNIZED
 
 
+# Statuses Alpaca documents as final ("no further updates"). Everything else,
+# including replaced, done_for_day, calculated, pending_cancel and unrecognized,
+# keeps its reservation active.
 TERMINAL_BROKER_STATUSES = {
     BrokerOrderStatus.FILLED, BrokerOrderStatus.CANCELED, BrokerOrderStatus.EXPIRED,
-    BrokerOrderStatus.REJECTED, BrokerOrderStatus.REPLACED,
+    BrokerOrderStatus.REJECTED,
 }
+
+
+class ReservationState(str, Enum):
+    HELD = "held"                  # claimed locally; broker acknowledgement not observed
+    ACKNOWLEDGED = "acknowledged"  # broker order observed and not final
+    RELEASED = "released"          # nothing left to protect (see releaseReason)
+
+
+class ReleaseReason(str, Enum):
+    NOT_SENT = "not_sent"              # connection never established
+    BROKER_REJECTED = "broker_rejected"  # explicit 4xx on submit
+    ORDER_TERMINAL = "order_terminal"    # filled, canceled, expired or rejected at Alpaca
 
 
 class ErrorCode(str, Enum):
@@ -98,6 +113,8 @@ class ErrorCode(str, Enum):
     ORDER_NOT_FOUND = "ORDER_NOT_FOUND"
     ORDER_NOT_CANCELABLE = "ORDER_NOT_CANCELABLE"
     ORIGIN_NOT_ALLOWED = "ORIGIN_NOT_ALLOWED"
+    RESOURCE_RESERVED = "RESOURCE_RESERVED"
+    RECONCILIATION_REQUIRED = "RECONCILIATION_REQUIRED"
 
 
 ERROR_STATUS = {
@@ -106,7 +123,8 @@ ERROR_STATUS = {
     ErrorCode.PROPOSAL_NOT_FOUND: 404, ErrorCode.ORDER_NOT_FOUND: 404,
     ErrorCode.MARKET_CLOSED: 409, ErrorCode.PROPOSAL_EXPIRED: 409,
     ErrorCode.SUBMISSION_IN_PROGRESS: 409, ErrorCode.SUBMISSION_UNCERTAIN: 409,
-    ErrorCode.ORDER_NOT_CANCELABLE: 409,
+    ErrorCode.ORDER_NOT_CANCELABLE: 409, ErrorCode.RESOURCE_RESERVED: 409,
+    ErrorCode.RECONCILIATION_REQUIRED: 409,
     ErrorCode.ACCOUNT_NOT_TRADABLE: 422, ErrorCode.ASSET_NOT_SUPPORTED: 422,
     ErrorCode.FRACTIONAL_NOT_SUPPORTED: 422, ErrorCode.ORDER_LIMIT_EXCEEDED: 422,
     ErrorCode.INSUFFICIENT_BUYING_POWER: 422, ErrorCode.INSUFFICIENT_POSITION: 422,
@@ -216,6 +234,15 @@ class Check(_Strict):
     detail: str
 
 
+class Reservation(_Strict):
+    resourceType: Literal["cash", "shares"]
+    symbol: str | None
+    amount: Decimal
+    consumed: Decimal
+    state: ReservationState
+    releaseReason: ReleaseReason | None
+
+
 class Proposal(_Strict):
     id: str
     environment: Environment
@@ -239,6 +266,7 @@ class Proposal(_Strict):
     checks: list[Check]
     warnings: list[str]
     updatedAt: str
+    reservation: Reservation | None = None  # latest reservation (Phase 5.5, additive)
 
 
 class BrokerOrder(_Strict):
