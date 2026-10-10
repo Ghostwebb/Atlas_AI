@@ -192,7 +192,9 @@ exact thresholds, status precedence, data quality and provenance, report wording
 HTTP supervision contract for all seven demo symbols. Phase 4 adds narration tests with a
 mocked HTTP transport (no LM Studio needed): configuration, evidence packet, output validation,
 fallback in both languages, connection/timeout/HTTP/malformed/busy cases and the
-`/api/report` contract.
+`/api/report` contract. Phase 7 adds strategy-agent tests: exact rule boundaries, missing and
+non-interpretable data, windows, units, evidence references, determinism, disagreement and the
+`/api/agents/analyze` contract.
 
 Frontend checks:
 
@@ -209,6 +211,8 @@ npm run build
 - `POST /api/analyze` with `{ "symbol": "NVDA" }` → analysis (see example above).
 - `POST /api/report` with `{ "symbol": "NVDA", "language": "es" }` → `{ analysis, narrative }`
   (see Phase 4 below).
+- `POST /api/agents/analyze` with `{ "symbol": "NVDA" }` → four strategy evaluations on one shared
+  snapshot (see Phase 7 below).
 
 Errors (`400` malformed input, `404` unknown symbol) share one shape:
 
@@ -271,6 +275,25 @@ backend. `/api/analyze` never calls the model.
 Setup, the full contract, validation limits, frontend guidance and the manual LM Studio check
 are in [docs/phase-4-narration.md](docs/phase-4-narration.md). The check against a real
 model has not been run yet.
+
+## Strategy agents (Phase 7)
+
+`POST /api/agents/analyze` evaluates one symbol with four explicit, deterministic strategies on
+the same snapshot. Each returns its own stance (`favorable`, `neutral`, `unfavorable` or
+`insufficient_data`), a score in [−1, 1], data coverage, evidence with references to
+`snapshot.metrics`, risks, missing data and limitations:
+
+- ARGO (value);
+- NOVA (growth);
+- VECTOR (momentum);
+- AEGIS (capital preservation).
+
+These are rules, not an LLM. They run on the synthetic demo dataset, and ARGO is only a limited
+P/E lens because the dataset has no book value, cash flow or debt. The agents do **not** form a
+committee yet, choose a winner, recommend allocations or create orders; that comparison is
+planned for Phase 8, and no agent will execute orders automatically. `/api/analyze` and
+`/api/report` are unchanged. Rules, thresholds, contract and examples are in
+[docs/phase-7-investment-agents.md](docs/phase-7-investment-agents.md).
 
 ## Later phases
 

@@ -2,6 +2,7 @@
 
 Phase 2: demo dataset + deterministic engine. Phase 3: deterministic supervisor.
 Phase 4: optional narrative report via a local LM Studio model (POST /api/report).
+Phase 7: deterministic strategy agents on one shared snapshot (POST /api/agents/analyze).
 """
 
 import os
@@ -12,6 +13,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.agents.engine import EvidenceIntegrityError
+from app.agents.models import AgentsAnalyzeRequest, AgentsAnalyzeResponse
+from app.agents.service import analyze_agents
+from app.agents.snapshot import SnapshotIntegrityError
 from app.analysis.service import analyze_symbol
 from app.data.demo_provider import DemoDataProvider
 from app.data.provider import MarketDataProvider
@@ -128,6 +133,26 @@ def report(payload: ReportRequest) -> ReportResponse | JSONResponse:
         )
     except SupervisionIntegrityError:
         return _integrity_error_response()
+    if result is None:
+        return _invalid_symbol_response(404)
+    return result
+
+
+@app.post(
+    "/api/agents/analyze",
+    response_model=AgentsAnalyzeResponse,
+    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 500: {"model": ErrorResponse}},
+)
+def agents_analyze(payload: AgentsAnalyzeRequest) -> AgentsAnalyzeResponse | JSONResponse:
+    # Only a symbol is accepted (extra fields -> 400): no client metrics, weights or URLs.
+    if not is_valid_format(payload.symbol):
+        return _invalid_symbol_response(400)
+    try:
+        result = analyze_agents(payload.symbol, market_data_provider)
+    except (EvidenceIntegrityError, SnapshotIntegrityError):
+        body = ErrorResponse(error="Agent evaluation integrity error",
+                             message="The strategy evaluations could not be verified and were not produced.")
+        return JSONResponse(status_code=500, content=body.model_dump())
     if result is None:
         return _invalid_symbol_response(404)
     return result
